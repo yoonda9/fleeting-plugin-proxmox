@@ -30,6 +30,9 @@ linters:
         - vm
         - wg
         - ig
+    wsl_v5:
+      disable:
+        - range
   exclusions:
     generated: lax
     presets:

@@ -9,7 +9,7 @@ import (
 
 var (
 	ErrNoIPAddress       = errors.New("failed to determine IP address for instance")
-	ErrTooManyPotentials = errors.New("cannot determine IP address when instance has greater than 1 non-loopback interface and no interface name was specified. Configure 'instance_network_interface' in your plugin config.")
+	ErrTooManyPotentials = errors.New("cannot determine IP address. instance has greater than 1 non-loopback interface and 'instance_network_interface' was not configured")
 )
 
 // Determines internal and external address for given interfaces.
@@ -97,7 +97,7 @@ func determinePossibleAddresses(networkInterfaces []*proxmox.AgentNetworkIface, 
 			}
 		}
 
-		// We found requested interface so we can break the loop
+		// We found a valid interface
 		break
 	}
 
