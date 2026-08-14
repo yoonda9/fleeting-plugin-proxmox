@@ -7,11 +7,27 @@ import (
 	"github.com/luthermonson/go-proxmox"
 )
 
-var ErrNoIPAddress = errors.New("failed to determine IP address for instance")
+var (
+	ErrNoIPAddress       = errors.New("failed to determine IP address for instance")
+	ErrTooManyPotentials = errors.New("cannot determine IP address. instance has greater than 1 non-loopback interface and 'instance_network_interface' was not configured")
+)
 
 // Determines internal and external address for given interfaces.
 func determineAddresses(networkInterfaces []*proxmox.AgentNetworkIface, requestedInterface string, requestedProtocol NetworkProtocol) (string, string, error) {
-	internalIPv4, externalIPv4, internalIPv6, externalIPv6 := determinePossibleAddresses(networkInterfaces, requestedInterface)
+	// Filter out any interfaces without a valid hardware address
+	var potentialInterfaces []*proxmox.AgentNetworkIface
+	for _, networkInterface := range networkInterfaces {
+		// Loopback hardware address is all zeros (*nix) or empty (Windows)
+		if networkInterface.HardwareAddress != "00:00:00:00:00:00" && networkInterface.HardwareAddress != "" {
+			potentialInterfaces = append(potentialInterfaces, networkInterface)
+		}
+	}
+
+	if requestedInterface == "" && len(potentialInterfaces) > 1 {
+		return "", "", ErrTooManyPotentials
+	}
+
+	internalIPv4, externalIPv4, internalIPv6, externalIPv6 := determinePossibleAddresses(potentialInterfaces, requestedInterface)
 
 	// IPv6 (or Any)
 	if requestedProtocol == NetworkProtocolIPv6 || requestedProtocol == NetworkProtocolAny {
@@ -42,11 +58,14 @@ func determineAddresses(networkInterfaces []*proxmox.AgentNetworkIface, requeste
 }
 
 // Finds possible IPv4 and IPv6 addresses for given interfaces.
-//
-//nolint:nakedret,nonamedreturns
-func determinePossibleAddresses(networkInterfaces []*proxmox.AgentNetworkIface, requestedInterface string) (internalIPv4, externalIPv4, internalIPv6, externalIPv6 string) {
+func determinePossibleAddresses(networkInterfaces []*proxmox.AgentNetworkIface, requestedInterface string) (string, string, string, string) {
+	internalIPv4 := ""
+	externalIPv4 := ""
+	internalIPv6 := ""
+	externalIPv6 := ""
+
 	for _, networkInterface := range networkInterfaces {
-		if networkInterface.Name != requestedInterface {
+		if requestedInterface != "" && networkInterface.Name != requestedInterface {
 			continue
 		}
 
@@ -78,9 +97,9 @@ func determinePossibleAddresses(networkInterfaces []*proxmox.AgentNetworkIface, 
 			}
 		}
 
-		// We found requested interface so we can break the loop
-		return
+		// We found a valid interface
+		break
 	}
 
-	return
+	return internalIPv4, externalIPv4, internalIPv6, externalIPv6
 }

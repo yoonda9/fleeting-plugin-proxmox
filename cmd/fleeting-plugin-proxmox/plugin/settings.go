@@ -29,8 +29,7 @@ const (
 
 // Default values for plugin settings.
 const (
-	DefaultInstanceNetworkInterface = "ens18"
-	DefaultInstanceNetworkProtocol  = NetworkProtocolIPv4
+	DefaultInstanceNetworkProtocol = NetworkProtocolIPv4
 
 	DefaultInstanceNameCreating = "fleeting-creating"
 	DefaultInstanceNameRunning  = "fleeting-running"
@@ -105,10 +104,6 @@ type Settings struct {
 }
 
 func (s *Settings) FillWithDefaults() {
-	if s.InstanceNetworkInterface == "" {
-		s.InstanceNetworkInterface = DefaultInstanceNetworkInterface
-	}
-
 	if s.InstanceNetworkProtocol == "" {
 		s.InstanceNetworkProtocol = DefaultInstanceNetworkProtocol
 	}
