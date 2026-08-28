@@ -185,6 +185,11 @@ func (ig *InstanceGroup) getTemplateCloneOptions(template *proxmox.VirtualMachin
 		Full:    true,
 	}
 
+	if ig.CloneBandwidthLimit != nil && *ig.CloneBandwidthLimit > 0 {
+		bwLimit := uint64(*ig.CloneBandwidthLimit)
+		cloneOptions.BWLimit = &bwLimit
+	}
+
 	if !template.Template && ig.Storage == "" {
 		return nil, ErrCloneVMWithoutConfiguredStorage
 	}

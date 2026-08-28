@@ -19,12 +19,18 @@ import (
 
 func TestInstanceGroup_templateCloneOptions(t *testing.T) {
 	type testCase struct {
-		name              string
-		isTemplate        bool
-		configuredStorage string
-		expectedFull      bool
-		expectedErr       error
+		name                     string
+		isTemplate               bool
+		configuredStorage        string
+		configuredBandwidthLimit *int
+		expectedFull             bool
+		expectedBWLimit          *uint64
+		expectedErr              error
 	}
+
+	positiveLimit := 500
+	zeroLimit := 0
+	expectedLimit := uint64(500)
 
 	testCases := []testCase{
 		{
@@ -55,6 +61,33 @@ func TestInstanceGroup_templateCloneOptions(t *testing.T) {
 			expectedFull:      true,
 			expectedErr:       nil,
 		},
+		{
+			name:                     "Bandwidth limit unset",
+			isTemplate:               true,
+			configuredStorage:        "local",
+			configuredBandwidthLimit: nil,
+			expectedFull:             true,
+			expectedBWLimit:          nil,
+			expectedErr:              nil,
+		},
+		{
+			name:                     "Bandwidth limit set",
+			isTemplate:               true,
+			configuredStorage:        "local",
+			configuredBandwidthLimit: &positiveLimit,
+			expectedFull:             true,
+			expectedBWLimit:          &expectedLimit,
+			expectedErr:              nil,
+		},
+		{
+			name:                     "Bandwidth limit explicitly zero",
+			isTemplate:               true,
+			configuredStorage:        "local",
+			configuredBandwidthLimit: &zeroLimit,
+			expectedFull:             true,
+			expectedBWLimit:          nil,
+			expectedErr:              nil,
+		},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -64,7 +97,8 @@ func TestInstanceGroup_templateCloneOptions(t *testing.T) {
 
 			ig := InstanceGroup{
 				Settings: Settings{
-					Storage: testCase.configuredStorage,
+					Storage:             testCase.configuredStorage,
+					CloneBandwidthLimit: testCase.configuredBandwidthLimit,
 				},
 			}
 
@@ -74,6 +108,7 @@ func TestInstanceGroup_templateCloneOptions(t *testing.T) {
 			if err == nil {
 				require.Equal(t, testCase.configuredStorage, result.Storage)
 				require.Equal(t, testCase.expectedFull, bool(result.Full))
+				require.Equal(t, testCase.expectedBWLimit, result.BWLimit)
 			}
 		})
 	}

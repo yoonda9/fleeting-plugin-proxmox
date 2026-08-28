@@ -10,15 +10,16 @@ import (
 var (
 	sampleURL = "https://example.com"
 	//nolint:gosec
-	sampleCredentialsPath      = "/tmp/proxmox_credentials.json"
-	samplePool                 = "sample_pool"
-	sampleStorage              = "sample_storage"
-	sampleTemplateID           = 20
-	sampleMaxInstances         = 7
-	sampleInstanceNameCreating = "proxmox-creating"
-	sampleInstanceNameRunning  = "running-prox"
-	sampleInstanceNameRemoving = "proxve-removing"
-	sampleInvalidTimeout       = 0
+	sampleCredentialsPath        = "/tmp/proxmox_credentials.json"
+	samplePool                   = "sample_pool"
+	sampleStorage                = "sample_storage"
+	sampleTemplateID             = 20
+	sampleMaxInstances           = 7
+	sampleInstanceNameCreating   = "proxmox-creating"
+	sampleInstanceNameRunning    = "running-prox"
+	sampleInstanceNameRemoving   = "proxve-removing"
+	sampleInvalidTimeout         = 0
+	sampleNegativeBandwidthLimit = -1
 )
 
 func TestSettings_fillWithDefaults(t *testing.T) {
@@ -271,6 +272,32 @@ func TestSettings_validateCloneConcurrency(t *testing.T) {
 	}
 }
 
+func TestSettings_validateCloneBandwidthLimit(t *testing.T) {
+	negative := -1
+	zero := 0
+	positive := 500
+
+	tests := []struct {
+		name          string
+		value         *int
+		expectedError error
+	}{
+		{"unset is valid", nil, nil},
+		{"positive is valid", &positive, nil},
+		{"zero is valid", &zero, nil},
+		{"negative is invalid", &negative, ErrSettingInvalidParameter},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings := &Settings{CloneBandwidthLimit: tt.value}
+
+			err := settings.validateCloneBandwidthLimit()
+			require.ErrorIs(t, err, tt.expectedError)
+		})
+	}
+}
+
 func TestSettings_validateVMIDRange(t *testing.T) {
 	var (
 		templateID = 20
@@ -470,6 +497,19 @@ func TestSettings_checkRequiredFields(t *testing.T) {
 				TemplateID:          &sampleTemplateID,
 				MaxInstances:        &sampleMaxInstances,
 				CloneConcurrency:    &sampleInvalidTimeout,
+			},
+			expectedError: ErrSettingInvalidParameter,
+		},
+		{
+			name: "Invalid clone bandwidth limit",
+			settings: Settings{
+				URL:                 sampleURL,
+				CredentialsFilePath: sampleCredentialsPath,
+				Pool:                samplePool,
+				Storage:             sampleStorage,
+				TemplateID:          &sampleTemplateID,
+				MaxInstances:        &sampleMaxInstances,
+				CloneBandwidthLimit: &sampleNegativeBandwidthLimit,
 			},
 			expectedError: ErrSettingInvalidParameter,
 		},

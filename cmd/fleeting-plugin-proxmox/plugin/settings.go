@@ -146,6 +146,10 @@ type Settings struct {
 	// Maximum number of clone tasks (POST through completion) in flight at once.
 	CloneConcurrency *int `json:"clone_concurrency"`
 
+	// Maximum clone bandwidth in KiB/s. Zero or unset preserves Proxmox VE's
+	// configured datacenter/storage default.
+	CloneBandwidthLimit *int `json:"clone_bandwidth_limit,omitempty"`
+
 	// Start (inclusive) of a dedicated VMID range for this manager. Unset uses
 	// /cluster/nextid instead. Must be set together with VMIDRangeEnd.
 	VMIDRangeStart *int `json:"vmid_range_start,omitempty"`
@@ -246,6 +250,7 @@ func (s *Settings) CheckRequiredFields() error {
 		{"http_max_idle_conns_per_host", s.validateHTTPMaxIdleConnsPerHost},
 		{"proxmox_api_retry_attempts", s.validateProxmoxAPIRetryAttempts},
 		{"clone_concurrency", s.validateCloneConcurrency},
+		{"clone_bandwidth_limit", s.validateCloneBandwidthLimit},
 	}
 
 	for _, v := range validators {
@@ -426,6 +431,16 @@ func (s *Settings) validateProxmoxAPIRetryAttempts() error {
 // validateCloneConcurrency checks that the clone concurrency, if set, is positive.
 func (s *Settings) validateCloneConcurrency() error {
 	return validatePositiveInt("clone_concurrency", s.CloneConcurrency)
+}
+
+// validateCloneBandwidthLimit checks that the clone bandwidth limit, if set, is
+// not negative. Zero is valid: it means "unset", not "no bandwidth".
+func (s *Settings) validateCloneBandwidthLimit() error {
+	if s.CloneBandwidthLimit != nil && *s.CloneBandwidthLimit < 0 {
+		return fmt.Errorf("%w: clone_bandwidth_limit: must not be negative", ErrSettingInvalidParameter)
+	}
+
+	return nil
 }
 
 // getDiskMaxIndex returns the maximum valid index for a given disk type.
