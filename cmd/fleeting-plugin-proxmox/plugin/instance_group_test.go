@@ -160,6 +160,20 @@ func increaseTestUPID(taskType string, vmid int) string {
 	return fmt.Sprintf("UPID:%s:00001A2B:00000000:00000000:%s:%d:root@pam:", increaseTestNode, taskType, vmid)
 }
 
+// constantHandler answers every request with body.
+func constantHandler(body string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, body) }
+}
+
+// registerVMRoutes serves the three endpoints getProxmoxVM walks for a single VM on
+// increaseTestNode: the node list entry, the VM's current status, and its config.
+func registerVMRoutes(mux *http.ServeMux, vmid int, status string) {
+	mux.HandleFunc("GET /nodes/"+increaseTestNode+"/status", constantHandler(`{"data":{}}`))
+	mux.HandleFunc(fmt.Sprintf("GET /nodes/%s/qemu/%d/status/current", increaseTestNode, vmid),
+		constantHandler(fmt.Sprintf(`{"data":{"vmid":%d,"status":%q}}`, vmid, status)))
+	mux.HandleFunc(fmt.Sprintf("GET /nodes/%s/qemu/%d/config", increaseTestNode, vmid), constantHandler(`{"data":{}}`))
+}
+
 // newIncreaseTestGroup wires an InstanceGroup to an httptest Proxmox serving the whole deploy
 // path -- nextid, clone, task, config, start, agent -- for the template and for the VMs cloned
 // from it, and answers the FIRST clone POST with a 500. That is the smallest way to make one
@@ -193,27 +207,23 @@ func newIncreaseTestGroup(t *testing.T, log hclog.Logger) *InstanceGroup {
 		return fmt.Sprintf("/nodes/%s/qemu/%d/%s", increaseTestNode, increaseTestTemplateID, suffix)
 	}
 
-	constant := func(body string) http.HandlerFunc {
-		return func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, body) }
-	}
-
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /pools/", constant(poolBody))
-	mux.HandleFunc("GET /cluster/status", constant(`{"data":[]}`))
-	mux.HandleFunc("GET /nodes/"+increaseTestNode+"/status", constant(`{"data":{}}`))
+	mux.HandleFunc("GET /pools/", constantHandler(poolBody))
+	mux.HandleFunc("GET /cluster/status", constantHandler(`{"data":[]}`))
+	mux.HandleFunc("GET /nodes/"+increaseTestNode+"/status", constantHandler(`{"data":{}}`))
 
 	// The template is the one VM that must report itself as a template, or the clone is
 	// refused before it reaches the API.
 	mux.HandleFunc("GET "+templateRoute("status/current"),
-		constant(fmt.Sprintf(`{"data":{"vmid":%d,"name":"template","status":"stopped","template":1}}`, increaseTestTemplateID)))
+		constantHandler(fmt.Sprintf(`{"data":{"vmid":%d,"name":"template","status":"stopped","template":1}}`, increaseTestTemplateID)))
 
 	mux.HandleFunc("GET "+vmRoute("status/current"), func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"data":{"vmid":%s,"name":"fleeting-creating","status":"running"}}`, r.PathValue("vmid"))
 	})
 
-	mux.HandleFunc("GET "+vmRoute("config"), constant(`{"data":{}}`))
-	mux.HandleFunc("GET "+vmRoute("agent/get-osinfo"), constant(`{"data":{"result":{}}}`))
+	mux.HandleFunc("GET "+vmRoute("config"), constantHandler(`{"data":{}}`))
+	mux.HandleFunc("GET "+vmRoute("agent/get-osinfo"), constantHandler(`{"data":{"result":{}}}`))
 
 	mux.HandleFunc("POST "+vmRoute("config"), func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"data":%q}`, increaseTestUPID("qmconfig", increaseTestVMID(t, r)))
@@ -317,4 +327,52 @@ func TestIncreaseReportsPartialBatch(t *testing.T) {
 	require.NoError(t, err, "a partial success reported as an error reaches the provisioner as no instances at all")
 	require.Equal(t, 1, succeeded, "the second clone deployed; the first was refused")
 	require.Regexp(t, `\[WARN\].*failed to deploy some instances: attempted=2 failed=1`, logBuffer.String())
+}
+
+// Heartbeat's retry closure must hand classifyError the raw AgentOsInfo error: wrapping it
+// first would defeat the 500/501 prefix check, and a real Proxmox 500 (a QMP get-osinfo timeout
+// under load, say) would declare a healthy instance unhealthy on the first bad poll instead of
+// retrying.
+func TestHeartbeatToleratesTransientAgentBlip(t *testing.T) {
+	t.Parallel()
+
+	const (
+		vmid = 100
+		node = increaseTestNode
+	)
+
+	var agentRequests atomic.Int64
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /pools/",
+		constantHandler(fmt.Sprintf(`{"data":[{"poolid":"test-pool","members":[{"id":"qemu/%d","type":"qemu","vmid":%d,"node":%q}]}]}`, vmid, vmid, node)))
+	registerVMRoutes(mux, vmid, "running")
+
+	mux.HandleFunc(fmt.Sprintf("GET /nodes/%s/qemu/%d/agent/get-osinfo", node, vmid), func(w http.ResponseWriter, r *http.Request) {
+		if agentRequests.Add(1) <= 2 {
+			// A bare 500 with a *valid* JSON body: go-proxmox's handleResponse returns before
+			// reading the body for 500/501, so classTransient must come from the status
+			// prefix, not an incidental decode failure.
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `{"data":{}}`)
+
+			return
+		}
+
+		agentOsInfoSuccessHandler(w, r)
+	})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	retryAttempts := 3
+
+	ig := newWaitTestGroup()
+	ig.Pool = "test-pool"
+	ig.ProxmoxAPIRetryAttempts = &retryAttempts
+	ig.proxmox = proxmox.NewClient(server.URL)
+
+	require.NoError(t, ig.Heartbeat(context.Background(), strconv.Itoa(vmid)))
+	require.Equal(t, int64(3), agentRequests.Load(), "the two transient polls must be retried, not reported")
 }

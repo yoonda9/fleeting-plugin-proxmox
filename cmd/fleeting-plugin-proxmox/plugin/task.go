@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"time"
 
 	"github.com/luthermonson/go-proxmox"
 )
@@ -52,6 +53,12 @@ func classifyTask(status, exitStatus string) error {
 }
 
 // waitTask waits for a Proxmox task to finish and turns a non-OK exit status into an error.
+//
+// It polls the task itself rather than delegating to Task.Wait, which returns on the very
+// first Ping error. Task waits are where the plugin spends nearly all of its time, so that is
+// where a loaded node is most likely to blip: a single 502 from an overloaded pveproxy would
+// otherwise fail a five-minute clone that is progressing perfectly well. A transient Ping
+// error is logged and the wait carries on; anything else fails the wait immediately.
 func (ig *InstanceGroup) waitTask(ctx context.Context, task *proxmox.Task) error {
 	// go-proxmox's NewTask returns nil for an empty UPID, so an operation Proxmox answers with
 	// null data yields no task. That may be a synchronous completion, so it is not an error
@@ -63,12 +70,38 @@ func (ig *InstanceGroup) waitTask(ctx context.Context, task *proxmox.Task) error
 		return nil
 	}
 
-	err := task.Wait(ctx, seconds(ig.ProxmoxTaskWaitInterval), seconds(ig.ProxmoxTaskWaitTimeout))
-	if err != nil {
-		return fmt.Errorf("failed while waiting for task '%s': %w", task.UPID, err)
-	}
+	ctx, cancel := context.WithTimeout(ctx, seconds(ig.ProxmoxTaskWaitTimeout))
+	defer cancel()
 
-	err = classifyTask(task.Status, task.ExitStatus)
+	for {
+		pingErr := task.Ping(ctx)
+
+		switch {
+		case pingErr == nil && task.Status != proxmox.TaskRunning:
+			return ig.taskOutcome(ctx, task)
+		case pingErr != nil && ctx.Err() == nil && classifyError(pingErr) == classTransient:
+			ig.log.Warn("Transient error polling Proxmox task, will keep waiting", "upid", task.UPID, "err", pingErr)
+		case pingErr != nil:
+			return fmt.Errorf("failed while waiting for task '%s': %w", task.UPID, pingErr)
+		}
+
+		// The gap is measured from the end of each poll rather than tick to tick: a ticker
+		// keeps running during Ping, so a poll slower than the interval finds its tick
+		// already buffered and polls again with no gap at all - on a loaded node, which is
+		// exactly when proxmox_task_wait_interval is meant to hold the request rate down.
+		// The interval is validated positive, so this cannot become a busy-poll.
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("failed while waiting for task '%s': %w", task.UPID, ctx.Err())
+		case <-time.After(seconds(ig.ProxmoxTaskWaitInterval)):
+		}
+	}
+}
+
+// taskOutcome turns a task that is no longer running into classifyTask's verdict, and pulls
+// Proxmox's own explanation into the log for a real failure.
+func (ig *InstanceGroup) taskOutcome(ctx context.Context, task *proxmox.Task) error {
+	err := classifyTask(task.Status, task.ExitStatus)
 	if err == nil {
 		return nil
 	}

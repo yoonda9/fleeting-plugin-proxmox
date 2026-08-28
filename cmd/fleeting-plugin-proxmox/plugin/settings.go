@@ -43,6 +43,7 @@ const (
 	DefaultCollectorInterval         int = 60
 	DefaultHTTPTimeout               int = 60
 	DefaultHTTPMaxIdleConnsPerHost   int = 8
+	DefaultProxmoxAPIRetryAttempts   int = 3
 )
 
 // Disk index limits for each disk type.
@@ -126,6 +127,11 @@ type Settings struct {
 
 	// Maximum idle HTTP connections to keep open per Proxmox VE host.
 	HTTPMaxIdleConnsPerHost *int `json:"http_max_idle_conns_per_host"`
+
+	// How many times a read-only Proxmox API call that keeps failing transiently is
+	// attempted in total, the first try included - so 1 means no retry at all and the
+	// default of 3 means two retries.
+	ProxmoxAPIRetryAttempts *int `json:"proxmox_api_retry_attempts"`
 }
 
 func (s *Settings) FillWithDefaults() {
@@ -156,6 +162,7 @@ func (s *Settings) FillWithDefaults() {
 	defaultInt(&s.CollectorInterval, DefaultCollectorInterval)
 	defaultInt(&s.HTTPTimeout, DefaultHTTPTimeout)
 	defaultInt(&s.HTTPMaxIdleConnsPerHost, DefaultHTTPMaxIdleConnsPerHost)
+	defaultInt(&s.ProxmoxAPIRetryAttempts, DefaultProxmoxAPIRetryAttempts)
 }
 
 // defaultInt points an unset optional integer setting at its default.
@@ -290,6 +297,7 @@ type settingUnit string
 const (
 	unitSeconds     settingUnit = "seconds"
 	unitConnections settingUnit = "connections"
+	unitAttempts    settingUnit = "attempts"
 )
 
 // validatePositiveSettings checks every optional integer setting that must be positive when
@@ -300,12 +308,14 @@ func (s *Settings) validatePositiveSettings() error {
 		unit  settingUnit
 		value *int
 	}{
+		{"proxmox_task_wait_interval", unitSeconds, s.ProxmoxTaskWaitInterval},
 		{"proxmox_task_wait_timeout", unitSeconds, s.ProxmoxTaskWaitTimeout},
 		{"instance_agent_start_timeout", unitSeconds, s.InstanceAgentStartTimeout},
 		{"instance_connect_timeout", unitSeconds, s.InstanceConnectTimeout},
 		{"collector_interval", unitSeconds, s.CollectorInterval},
 		{"http_timeout", unitSeconds, s.HTTPTimeout},
 		{"http_max_idle_conns_per_host", unitConnections, s.HTTPMaxIdleConnsPerHost},
+		{"proxmox_api_retry_attempts", unitAttempts, s.ProxmoxAPIRetryAttempts},
 	} {
 		if setting.value != nil && *setting.value <= 0 {
 			return fmt.Errorf("%w: %s: must be a positive number of %s", ErrSettingInvalidParameter, setting.name, setting.unit)

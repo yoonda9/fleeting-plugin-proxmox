@@ -38,6 +38,7 @@ func TestSettings_fillWithDefaults(t *testing.T) {
 	require.Equal(t, 60, *settings.CollectorInterval)
 	require.Equal(t, 60, *settings.HTTPTimeout)
 	require.Equal(t, 8, *settings.HTTPMaxIdleConnsPerHost)
+	require.Equal(t, 3, *settings.ProxmoxAPIRetryAttempts)
 
 	settings2 := Settings{
 		InstanceNameCreating: sampleInstanceNameCreating,
@@ -58,6 +59,7 @@ func TestSettings_fillWithDefaults_timeoutsHonoured(t *testing.T) {
 	collectorInterval := 444
 	httpTimeout := 555
 	httpMaxIdleConnsPerHost := 16
+	proxmoxAPIRetryAttempts := 5
 
 	settings := Settings{
 		ProxmoxTaskWaitTimeout:    &taskWaitTimeout,
@@ -66,6 +68,7 @@ func TestSettings_fillWithDefaults_timeoutsHonoured(t *testing.T) {
 		CollectorInterval:         &collectorInterval,
 		HTTPTimeout:               &httpTimeout,
 		HTTPMaxIdleConnsPerHost:   &httpMaxIdleConnsPerHost,
+		ProxmoxAPIRetryAttempts:   &proxmoxAPIRetryAttempts,
 	}
 	settings.FillWithDefaults()
 
@@ -75,6 +78,7 @@ func TestSettings_fillWithDefaults_timeoutsHonoured(t *testing.T) {
 	require.Equal(t, collectorInterval, *settings.CollectorInterval)
 	require.Equal(t, httpTimeout, *settings.HTTPTimeout)
 	require.Equal(t, httpMaxIdleConnsPerHost, *settings.HTTPMaxIdleConnsPerHost)
+	require.Equal(t, proxmoxAPIRetryAttempts, *settings.ProxmoxAPIRetryAttempts)
 }
 
 func TestSettings_validateTimeoutSettings(t *testing.T) {
@@ -97,12 +101,14 @@ func TestSettings_validateTimeoutSettings(t *testing.T) {
 		name     string
 		setValue func(*Settings, *int)
 	}{
+		{"proxmox_task_wait_interval", func(s *Settings, v *int) { s.ProxmoxTaskWaitInterval = v }},
 		{"proxmox_task_wait_timeout", func(s *Settings, v *int) { s.ProxmoxTaskWaitTimeout = v }},
 		{"instance_agent_start_timeout", func(s *Settings, v *int) { s.InstanceAgentStartTimeout = v }},
 		{"instance_connect_timeout", func(s *Settings, v *int) { s.InstanceConnectTimeout = v }},
 		{"collector_interval", func(s *Settings, v *int) { s.CollectorInterval = v }},
 		{"http_timeout", func(s *Settings, v *int) { s.HTTPTimeout = v }},
 		{"http_max_idle_conns_per_host", func(s *Settings, v *int) { s.HTTPMaxIdleConnsPerHost = v }},
+		{"proxmox_api_retry_attempts", func(s *Settings, v *int) { s.ProxmoxAPIRetryAttempts = v }},
 	}
 
 	for _, field := range fields {
