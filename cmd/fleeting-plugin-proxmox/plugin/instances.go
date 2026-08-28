@@ -21,21 +21,7 @@ const (
 var ErrCloneVMWithoutConfiguredStorage = errors.New("attempted to clone a VM without configured storage")
 
 func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.VirtualMachine) (int, error) {
-	VMID, task, err := ig.cloneTemplate(ctx, template)
-	if err == nil {
-		ig.log.Info("Deploying new instance", "vmid", VMID)
-
-		err = ig.waitTask(ctx, task, ig.taskWaitTimeout())
-		if err != nil {
-			// The clone POST succeeded, so VMID is allocated and Proxmox rolls
-			// the target config back when the clone worker fails - but a wait
-			// that merely timed out may still land, so ReleaseIfFree reconfirms
-			// with the cluster before giving the reservation back rather than
-			// risk handing a live id to another clone.
-			ig.vmids.ReleaseIfFree(ctx, VMID)
-		}
-	}
-
+	VMID, err := ig.cloneAndWaitForTemplate(ctx, template)
 	if err != nil {
 		return VMID, fmt.Errorf("failed to deploy instance: %w", err)
 	}
@@ -113,6 +99,59 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 	}
 
 	return VMID, nil
+}
+
+// cloneConcurrencySemaphore lazily builds the buffered channel that bounds
+// concurrent clone tasks, sized from clone_concurrency. Lazy so InstanceGroup
+// values built directly (e.g. in tests, without Init/FillWithDefaults) still
+// get a working, correctly-sized bound instead of blocking on a nil channel.
+func (ig *InstanceGroup) cloneConcurrencySemaphore() chan struct{} {
+	ig.cloneSemaphoreOnce.Do(func() {
+		concurrency := DefaultCloneConcurrency
+		if ig.CloneConcurrency != nil {
+			concurrency = *ig.CloneConcurrency
+		}
+
+		ig.cloneSemaphore = make(chan struct{}, concurrency)
+	})
+
+	return ig.cloneSemaphore
+}
+
+// cloneAndWaitForTemplate clones the template and waits for the clone task to
+// complete, bounded by clone_concurrency. The semaphore is held across
+// waitTask, not just the POST: Clone returns a UPID immediately and the disk
+// copy happens in Proxmox's forked worker, so a semaphore around the POST
+// alone would bound nothing.
+func (ig *InstanceGroup) cloneAndWaitForTemplate(ctx context.Context, template *proxmox.VirtualMachine) (int, error) {
+	semaphore := ig.cloneConcurrencySemaphore()
+
+	select {
+	case semaphore <- struct{}{}:
+	case <-ctx.Done():
+		return -1, fmt.Errorf("failed to acquire a clone concurrency slot: %w", ctx.Err())
+	}
+
+	defer func() { <-semaphore }()
+
+	VMID, task, err := ig.cloneTemplate(ctx, template)
+	if err != nil {
+		return VMID, err
+	}
+
+	ig.log.Info("Deploying new instance", "vmid", VMID)
+
+	err = ig.waitTask(ctx, task, ig.taskWaitTimeout())
+	if err != nil {
+		// The clone POST succeeded, so VMID is allocated and Proxmox rolls the
+		// target config back when the clone worker fails - but a wait that
+		// merely timed out may still land, so ReleaseIfFree reconfirms with the
+		// cluster before giving the reservation back rather than risk handing a
+		// live id to another clone.
+		ig.vmids.ReleaseIfFree(ctx, VMID)
+	}
+
+	return VMID, err
 }
 
 func (ig *InstanceGroup) cloneTemplate(ctx context.Context, template *proxmox.VirtualMachine) (int, *proxmox.Task, error) {

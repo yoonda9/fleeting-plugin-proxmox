@@ -43,7 +43,18 @@ const (
 	DefaultHTTPTimeout               int = 60
 	DefaultHTTPMaxIdleConnsPerHost   int = 8
 	DefaultProxmoxAPIRetryAttempts   int = 3
+	DefaultCloneConcurrency          int = 4
+
+	idleConnsCloneConcurrencyHeadroom = 4
 )
+
+// defaultHTTPMaxIdleConnsPerHost derives the idle-connection pool size from
+// clone concurrency: each in-flight clone holds an HTTP connection open, so a
+// clone_concurrency raised above the flat default previously left too few
+// idle connections and forced the transport to reopen them mid-burst.
+func defaultHTTPMaxIdleConnsPerHost(cloneConcurrency int) int {
+	return max(DefaultHTTPMaxIdleConnsPerHost, cloneConcurrency+idleConnsCloneConcurrencyHeadroom)
+}
 
 // Disk index limits for each disk type.
 const (
@@ -125,10 +136,15 @@ type Settings struct {
 	HTTPTimeout *int `json:"http_timeout"`
 
 	// Maximum idle HTTP connections to keep open per Proxmox VE host.
+	// Defaults to max(8, clone_concurrency + 4), so idle connections scale
+	// with the number of clones that can be in flight at once.
 	HTTPMaxIdleConnsPerHost *int `json:"http_max_idle_conns_per_host"`
 
 	// How many times to retry a read-only Proxmox API call that failed transiently.
 	ProxmoxAPIRetryAttempts *int `json:"proxmox_api_retry_attempts"`
+
+	// Maximum number of clone tasks (POST through completion) in flight at once.
+	CloneConcurrency *int `json:"clone_concurrency"`
 
 	// Start (inclusive) of a dedicated VMID range for this manager. Unset uses
 	// /cluster/nextid instead. Must be set together with VMIDRangeEnd.
@@ -190,14 +206,19 @@ func (s *Settings) FillWithDefaults() {
 		*s.HTTPTimeout = DefaultHTTPTimeout
 	}
 
-	if s.HTTPMaxIdleConnsPerHost == nil {
-		s.HTTPMaxIdleConnsPerHost = new(int)
-		*s.HTTPMaxIdleConnsPerHost = DefaultHTTPMaxIdleConnsPerHost
-	}
-
 	if s.ProxmoxAPIRetryAttempts == nil {
 		s.ProxmoxAPIRetryAttempts = new(int)
 		*s.ProxmoxAPIRetryAttempts = DefaultProxmoxAPIRetryAttempts
+	}
+
+	if s.CloneConcurrency == nil {
+		s.CloneConcurrency = new(int)
+		*s.CloneConcurrency = DefaultCloneConcurrency
+	}
+
+	if s.HTTPMaxIdleConnsPerHost == nil {
+		s.HTTPMaxIdleConnsPerHost = new(int)
+		*s.HTTPMaxIdleConnsPerHost = defaultHTTPMaxIdleConnsPerHost(*s.CloneConcurrency)
 	}
 }
 
@@ -224,6 +245,7 @@ func (s *Settings) CheckRequiredFields() error {
 		{"http_timeout", s.validateHTTPTimeout},
 		{"http_max_idle_conns_per_host", s.validateHTTPMaxIdleConnsPerHost},
 		{"proxmox_api_retry_attempts", s.validateProxmoxAPIRetryAttempts},
+		{"clone_concurrency", s.validateCloneConcurrency},
 	}
 
 	for _, v := range validators {
@@ -399,6 +421,11 @@ func (s *Settings) validateHTTPMaxIdleConnsPerHost() error {
 // validateProxmoxAPIRetryAttempts checks that the retry attempts count, if set, is positive.
 func (s *Settings) validateProxmoxAPIRetryAttempts() error {
 	return validatePositiveInt("proxmox_api_retry_attempts", s.ProxmoxAPIRetryAttempts)
+}
+
+// validateCloneConcurrency checks that the clone concurrency, if set, is positive.
+func (s *Settings) validateCloneConcurrency() error {
+	return validatePositiveInt("clone_concurrency", s.CloneConcurrency)
 }
 
 // getDiskMaxIndex returns the maximum valid index for a given disk type.

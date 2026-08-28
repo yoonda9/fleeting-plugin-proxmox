@@ -41,6 +41,13 @@ type InstanceGroup struct {
 	// can never be handed the same ID. See vmid.go.
 	vmids *vmidAllocator `json:"-"`
 
+	// cloneSemaphore bounds concurrent clone tasks (POST through completion) to
+	// clone_concurrency; lazily built by cloneConcurrencySemaphore so InstanceGroup
+	// values built directly (e.g. in tests, without Init/FillWithDefaults) still
+	// get a working bound. See instances.go's cloneAndWaitForTemplate.
+	cloneSemaphoreOnce sync.Once     `json:"-"`
+	cloneSemaphore     chan struct{} `json:"-"`
+
 	// This mutex is used when cloning template for new instances. It is required for blocking other
 	// operations like collection or update, because when new instance is created with recycled ID then for
 	// a brief period it will be reported from Proxmox with old name (e.g. InstanceNameRemoving).
