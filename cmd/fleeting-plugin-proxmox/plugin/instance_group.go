@@ -37,6 +37,10 @@ type InstanceGroup struct {
 	// can never be handed the same ID. See vmid.go.
 	vmids *vmidAllocator `json:"-"`
 
+	// cloneSemaphore bounds concurrent clone tasks (POST through completion) to
+	// clone_concurrency. See instances.go's cloneAndWaitForTemplate.
+	cloneSemaphore chan struct{} `json:"-"`
+
 	// This mutex is used when cloning template for new instances. It is required for blocking other
 	// operations like collection or update, because when new instance is created with recycled ID then for
 	// a brief period it will be reported from Proxmox with old name (e.g. InstanceNameRemoving).
@@ -84,6 +88,7 @@ func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings
 	}
 
 	ig.vmids = ig.clusterVMIDAllocator()
+	ig.cloneSemaphore = make(chan struct{}, *ig.CloneConcurrency)
 
 	err = ig.markStaleInstancesForRemoval(ctx)
 	if err != nil {

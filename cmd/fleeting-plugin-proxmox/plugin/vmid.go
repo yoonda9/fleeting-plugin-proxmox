@@ -111,12 +111,12 @@ func (a *vmidAllocator) Allocate(ctx context.Context) (int, error) {
 // Release policy across the plugin (kept in one place): a clone POST failure
 // releases immediately (cloneTemplate in instances.go, the id was never sent
 // to Proxmox); a clone task failure releases via ReleaseIfFree
-// (deployInstance in instances.go, the id may or may not have landed); a
-// confirmed instance delete releases immediately (collectInstance in
-// collector.go); every other failure to stop or fetch an instance leaves the
+// (cloneAndWaitForTemplate in instances.go, the id may or may not have
+// landed); a confirmed instance delete releases immediately (collectInstance
+// in collector.go); every other failure to stop or fetch an instance leaves the
 // reservation in place rather than risk freeing an id that is still live. A
 // deployed instance that fails to locate its VM or write its creating tag
-// (deployInstance again) is never renamed to InstanceNameRemoving, so the
+// (deployInstance) is never renamed to InstanceNameRemoving, so the
 // collector never sees it to release either - a slow reservation drain, not a
 // brick, since it only consumes vmidAllocateAttempts worth of headroom rather
 // than repeating on every future clone.

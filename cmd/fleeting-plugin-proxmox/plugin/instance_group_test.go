@@ -273,20 +273,7 @@ func newIncreaseTestGroup(t *testing.T, log hclog.Logger) *InstanceGroup {
 
 	// Every task the fake hands out succeeded; the batch's one failure is the refused clone,
 	// which never produced a task at all.
-	mux.HandleFunc("GET /nodes/"+increaseTestNode+"/tasks/", func(w http.ResponseWriter, r *http.Request) {
-		upid := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/nodes/"+increaseTestNode+"/tasks/"), "/status")
-
-		fields := strings.Split(upid, ":")
-		if len(fields) < 8 {
-			t.Errorf("task route asked for a malformed UPID: %q", upid)
-			http.Error(w, "malformed upid", http.StatusBadRequest)
-
-			return
-		}
-
-		fmt.Fprintf(w, `{"data":{"upid":%q,"node":%q,"type":%q,"id":%q,"user":"root@pam","status":%q,"exitstatus":%q}}`,
-			upid, increaseTestNode, fields[5], fields[6], taskStatusStopped, taskExitStatusOK)
-	})
+	mux.HandleFunc("GET /nodes/"+increaseTestNode+"/tasks/", taskSucceededHandler(t))
 
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
@@ -307,6 +294,27 @@ func newIncreaseTestGroup(t *testing.T, log hclog.Logger) *InstanceGroup {
 	ig.vmids = ig.clusterVMIDAllocator()
 
 	return ig
+}
+
+// taskSucceededHandler serves the tasks route for any task the fake handed out, reporting
+// it stopped with an OK exit status. Task.Ping reads the node, type and id back out of the
+// UPID, so the handler echoes them from the path without having recorded the task.
+func taskSucceededHandler(t *testing.T) http.HandlerFunc {
+	t.Helper()
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		upid := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/nodes/"+increaseTestNode+"/tasks/"), "/status")
+
+		fields := strings.Split(upid, ":")
+		if len(fields) < 8 {
+			t.Errorf("task route asked for a malformed UPID: %q", upid)
+			http.Error(w, "malformed upid", http.StatusBadRequest)
+
+			return
+		}
+
+		fmt.Fprint(w, taskStatusBodyFor(upid, fields[5], fields[6], taskStatusStopped, taskExitStatusOK))
+	}
 }
 
 // increaseTestVMID reads the vmid a VM route was called for, so a task UPID can name the VM

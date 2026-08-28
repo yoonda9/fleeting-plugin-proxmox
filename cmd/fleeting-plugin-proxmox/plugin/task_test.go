@@ -26,8 +26,14 @@ func testUPID(taskType string) proxmox.UPID {
 // this payload on every poll, so omitting them would blank out task.UPID after the first poll
 // and crash the second one.
 func taskStatusBody(taskType, status, exitStatus string) string {
-	return fmt.Sprintf(`{"data":{"upid":%q,"node":"pve-node","type":%q,"id":"100","user":"root@pam","status":%q,"exitstatus":%q}}`,
-		testUPID(taskType), taskType, status, exitStatus)
+	return taskStatusBodyFor(string(testUPID(taskType)), taskType, "100", status, exitStatus)
+}
+
+// taskStatusBodyFor is taskStatusBody for any task on the fake node, named by its UPID and the
+// type and id that UPID carries.
+func taskStatusBodyFor(upid, taskType, id, status, exitStatus string) string {
+	return fmt.Sprintf(`{"data":{"upid":%q,"node":"pve-node","type":%q,"id":%q,"user":"root@pam","status":%q,"exitstatus":%q}}`,
+		upid, taskType, id, status, exitStatus)
 }
 
 // taskHandler serves a task's /status and /log endpoints, reporting the given outcome, and
@@ -48,9 +54,10 @@ func taskHandler(t *testing.T, taskType, status, exitStatus, logLine string) htt
 	}
 }
 
-// newWaitTestGroup is an InstanceGroup with every setting at its default except the ones a
-// wait reads, which are one second: every fake here answers immediately, so a wait that is
-// still going after a second is a bug, not a slow server.
+// newWaitTestGroup is an InstanceGroup as Init would build it for talking to Proxmox, minus
+// the client: every setting at its default except the ones a wait reads, which are one
+// second, because every fake here answers immediately and a wait still going after a second
+// is a bug, not a slow server.
 func newWaitTestGroup() *InstanceGroup {
 	ig := &InstanceGroup{log: hclog.NewNullLogger()}
 	ig.FillWithDefaults()
@@ -58,6 +65,8 @@ func newWaitTestGroup() *InstanceGroup {
 	*ig.ProxmoxTaskWaitInterval = 1
 	*ig.ProxmoxTaskWaitTimeout = 1
 	*ig.InstanceAgentStartTimeout = 1
+
+	ig.cloneSemaphore = make(chan struct{}, *ig.CloneConcurrency)
 
 	return ig
 }

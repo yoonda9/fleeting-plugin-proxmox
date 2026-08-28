@@ -39,6 +39,7 @@ func TestSettings_fillWithDefaults(t *testing.T) {
 	require.Equal(t, 60, *settings.HTTPTimeout)
 	require.Equal(t, 8, *settings.HTTPMaxIdleConnsPerHost)
 	require.Equal(t, 3, *settings.ProxmoxAPIRetryAttempts)
+	require.Equal(t, 4, *settings.CloneConcurrency)
 
 	settings2 := Settings{
 		InstanceNameCreating: sampleInstanceNameCreating,
@@ -60,6 +61,7 @@ func TestSettings_fillWithDefaults_timeoutsHonoured(t *testing.T) {
 	httpTimeout := 555
 	httpMaxIdleConnsPerHost := 16
 	proxmoxAPIRetryAttempts := 5
+	cloneConcurrency := 2
 
 	settings := Settings{
 		ProxmoxTaskWaitTimeout:    &taskWaitTimeout,
@@ -69,6 +71,7 @@ func TestSettings_fillWithDefaults_timeoutsHonoured(t *testing.T) {
 		HTTPTimeout:               &httpTimeout,
 		HTTPMaxIdleConnsPerHost:   &httpMaxIdleConnsPerHost,
 		ProxmoxAPIRetryAttempts:   &proxmoxAPIRetryAttempts,
+		CloneConcurrency:          &cloneConcurrency,
 	}
 	settings.FillWithDefaults()
 
@@ -79,6 +82,36 @@ func TestSettings_fillWithDefaults_timeoutsHonoured(t *testing.T) {
 	require.Equal(t, httpTimeout, *settings.HTTPTimeout)
 	require.Equal(t, httpMaxIdleConnsPerHost, *settings.HTTPMaxIdleConnsPerHost)
 	require.Equal(t, proxmoxAPIRetryAttempts, *settings.ProxmoxAPIRetryAttempts)
+	require.Equal(t, cloneConcurrency, *settings.CloneConcurrency)
+}
+
+// TestSettings_fillWithDefaults_httpMaxIdleConnsPerHostDerivedFromCloneConcurrency
+// is the regression test for a backward-compatibility break:
+// a fixed DefaultHTTPMaxIdleConnsPerHost meant raising clone_concurrency well
+// above 4 left too few idle connections for the in-flight clones, forcing the
+// transport to reopen them mid-burst. The default must derive from
+// clone_concurrency so an unset idle-conns setting always covers it.
+func TestSettings_fillWithDefaults_httpMaxIdleConnsPerHostDerivedFromCloneConcurrency(t *testing.T) {
+	tests := []struct {
+		name             string
+		cloneConcurrency int
+		expectedConns    int
+	}{
+		{"default clone concurrency derives the documented default", 4, 8},
+		{"just above the floor is unclamped", 5, 9},
+		{"clone concurrency above the flat default derives above it", 20, 24},
+		{"low clone concurrency still clamps to the flat floor", 1, 8},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cloneConcurrency := tt.cloneConcurrency
+			settings := Settings{CloneConcurrency: &cloneConcurrency}
+			settings.FillWithDefaults()
+
+			require.Equal(t, tt.expectedConns, *settings.HTTPMaxIdleConnsPerHost)
+		})
+	}
 }
 
 func TestSettings_validateTimeoutSettings(t *testing.T) {
@@ -109,6 +142,7 @@ func TestSettings_validateTimeoutSettings(t *testing.T) {
 		{"http_timeout", func(s *Settings, v *int) { s.HTTPTimeout = v }},
 		{"http_max_idle_conns_per_host", func(s *Settings, v *int) { s.HTTPMaxIdleConnsPerHost = v }},
 		{"proxmox_api_retry_attempts", func(s *Settings, v *int) { s.ProxmoxAPIRetryAttempts = v }},
+		{"clone_concurrency", func(s *Settings, v *int) { s.CloneConcurrency = v }},
 	}
 
 	for _, field := range fields {

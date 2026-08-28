@@ -42,8 +42,14 @@ const (
 	DefaultInstanceConnectTimeout    int = 60
 	DefaultCollectorInterval         int = 60
 	DefaultHTTPTimeout               int = 60
-	DefaultHTTPMaxIdleConnsPerHost   int = 8
 	DefaultProxmoxAPIRetryAttempts   int = 3
+	DefaultCloneConcurrency          int = 4
+
+	// DefaultHTTPMaxIdleConnsPerHost is the floor of the derived
+	// http_max_idle_conns_per_host default, max(8, clone_concurrency + 4).
+	DefaultHTTPMaxIdleConnsPerHost int = 8
+
+	idleConnsCloneConcurrencyHeadroom = 4
 )
 
 // Disk index limits for each disk type.
@@ -126,12 +132,17 @@ type Settings struct {
 	HTTPTimeout *int `json:"http_timeout"`
 
 	// Maximum idle HTTP connections to keep open per Proxmox VE host.
+	// Defaults to max(8, clone_concurrency + 4), so idle connections scale
+	// with the number of clones that can be in flight at once.
 	HTTPMaxIdleConnsPerHost *int `json:"http_max_idle_conns_per_host"`
 
 	// How many times a read-only Proxmox API call that keeps failing transiently is
 	// attempted in total, the first try included - so 1 means no retry at all and the
 	// default of 3 means two retries.
 	ProxmoxAPIRetryAttempts *int `json:"proxmox_api_retry_attempts"`
+
+	// Maximum number of clone tasks (POST through completion) in flight at once.
+	CloneConcurrency *int `json:"clone_concurrency"`
 }
 
 func (s *Settings) FillWithDefaults() {
@@ -161,8 +172,12 @@ func (s *Settings) FillWithDefaults() {
 	defaultInt(&s.InstanceConnectTimeout, DefaultInstanceConnectTimeout)
 	defaultInt(&s.CollectorInterval, DefaultCollectorInterval)
 	defaultInt(&s.HTTPTimeout, DefaultHTTPTimeout)
-	defaultInt(&s.HTTPMaxIdleConnsPerHost, DefaultHTTPMaxIdleConnsPerHost)
 	defaultInt(&s.ProxmoxAPIRetryAttempts, DefaultProxmoxAPIRetryAttempts)
+	defaultInt(&s.CloneConcurrency, DefaultCloneConcurrency)
+	// Each in-flight clone holds an HTTP connection open, so the idle pool scales with
+	// clone_concurrency (plus headroom for everything else) instead of a flat default
+	// that left a raised clone_concurrency reopening connections mid-burst.
+	defaultInt(&s.HTTPMaxIdleConnsPerHost, max(DefaultHTTPMaxIdleConnsPerHost, *s.CloneConcurrency+idleConnsCloneConcurrencyHeadroom))
 }
 
 // defaultInt points an unset optional integer setting at its default.
@@ -298,6 +313,7 @@ const (
 	unitSeconds     settingUnit = "seconds"
 	unitConnections settingUnit = "connections"
 	unitAttempts    settingUnit = "attempts"
+	unitClones      settingUnit = "clones"
 )
 
 // validatePositiveSettings checks every optional integer setting that must be positive when
@@ -316,6 +332,7 @@ func (s *Settings) validatePositiveSettings() error {
 		{"http_timeout", unitSeconds, s.HTTPTimeout},
 		{"http_max_idle_conns_per_host", unitConnections, s.HTTPMaxIdleConnsPerHost},
 		{"proxmox_api_retry_attempts", unitAttempts, s.ProxmoxAPIRetryAttempts},
+		{"clone_concurrency", unitClones, s.CloneConcurrency},
 	} {
 		if setting.value != nil && *setting.value <= 0 {
 			return fmt.Errorf("%w: %s: must be a positive number of %s", ErrSettingInvalidParameter, setting.name, setting.unit)
