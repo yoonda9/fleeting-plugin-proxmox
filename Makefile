@@ -93,7 +93,7 @@ test: unit-test integration-test
 
 unit-test: vendor
 	@$(call INFO,"Running unit tests")
-	go test -v ./cmd/...
+	go test -v -race ./cmd/...
 .PHONY: unit-test
 
 integration-test: bin/fleeting-plugin-proxmox
