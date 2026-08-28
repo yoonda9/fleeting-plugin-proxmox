@@ -116,6 +116,33 @@ func (ig *InstanceGroup) Shutdown(_ context.Context) error {
 	return nil
 }
 
+// deployResult is the outcome of a single deployInstance call.
+type deployResult struct {
+	vmid int
+	err  error
+}
+
+// tallyDeployments counts how many results succeeded and joins the errors of
+// every failure into a single wrapped error.
+func tallyDeployments(results []deployResult) (int, error) {
+	var (
+		succeeded int
+		errs      []error
+	)
+
+	for _, result := range results {
+		if result.err != nil {
+			errs = append(errs, result.err)
+
+			continue
+		}
+
+		succeeded++
+	}
+
+	return succeeded, errors.Join(errs...)
+}
+
 // Increase implements provider.InstanceGroup.
 func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 	template, err := ig.getProxmoxVM(ctx, *ig.TemplateID)
@@ -126,8 +153,7 @@ func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 	var (
 		errorGroup = new(errgroup.Group)
 
-		succeeded   = 0
-		succeededMu = new(sync.Mutex)
+		results = make([]deployResult, count)
 
 		// We need to mutex cloning as Proxmox will fail multiple requests in parallel
 		cloneMu = new(sync.Mutex)
@@ -136,23 +162,24 @@ func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 	ig.instanceCloningMu.Lock()
 	defer ig.instanceCloningMu.Unlock()
 
-	for range count {
+	for index := range count {
 		errorGroup.Go(func() error {
 			vmid, err := ig.deployInstance(ctx, template, cloneMu)
 			if err != nil {
 				ig.log.Error("failed to deploy an instance", "vmid", vmid, "err", err)
+			} else {
+				ig.log.Info("successfully deployed instance", "vmid", vmid)
 			}
 
-			ig.log.Info("successfully deployed instance", "vmid", vmid)
-			succeededMu.Lock()
-			succeeded++
-			succeededMu.Unlock()
+			results[index] = deployResult{vmid: vmid, err: err}
 
 			return err
 		})
 	}
 
-	err = errorGroup.Wait()
+	_ = errorGroup.Wait()
+
+	succeeded, err := tallyDeployments(results)
 	if err != nil {
 		return succeeded, fmt.Errorf("failed to create one or more instances: %w", err)
 	}
