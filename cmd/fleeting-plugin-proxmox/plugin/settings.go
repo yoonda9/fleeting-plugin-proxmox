@@ -41,6 +41,8 @@ const (
 	DefaultInstanceAgentStartTimeout int = 120
 	DefaultInstanceConnectTimeout    int = 60
 	DefaultCollectorInterval         int = 60
+	DefaultHTTPTimeout               int = 60
+	DefaultHTTPMaxIdleConnsPerHost   int = 8
 )
 
 // Disk index limits for each disk type.
@@ -118,6 +120,12 @@ type Settings struct {
 
 	// How often the collector polls for instances to remove.
 	CollectorInterval *int `json:"collector_interval"`
+
+	// Per-request deadline for calls to the Proxmox VE API.
+	HTTPTimeout *int `json:"http_timeout"`
+
+	// Maximum idle HTTP connections to keep open per Proxmox VE host.
+	HTTPMaxIdleConnsPerHost *int `json:"http_max_idle_conns_per_host"`
 }
 
 func (s *Settings) FillWithDefaults() {
@@ -142,14 +150,12 @@ func (s *Settings) FillWithDefaults() {
 	}
 
 	defaultInt(&s.ProxmoxTaskWaitInterval, DefaultProxmoxTaskWaitInterval)
-
 	defaultInt(&s.ProxmoxTaskWaitTimeout, DefaultProxmoxTaskWaitTimeout)
-
 	defaultInt(&s.InstanceAgentStartTimeout, DefaultInstanceAgentStartTimeout)
-
 	defaultInt(&s.InstanceConnectTimeout, DefaultInstanceConnectTimeout)
-
 	defaultInt(&s.CollectorInterval, DefaultCollectorInterval)
+	defaultInt(&s.HTTPTimeout, DefaultHTTPTimeout)
+	defaultInt(&s.HTTPMaxIdleConnsPerHost, DefaultHTTPMaxIdleConnsPerHost)
 }
 
 // defaultInt points an unset optional integer setting at its default.
@@ -281,7 +287,10 @@ func (s *Settings) validateInstanceAutoresizeDisk() error {
 // settingUnit is the unit an error message quotes for a positive integer setting.
 type settingUnit string
 
-const unitSeconds settingUnit = "seconds"
+const (
+	unitSeconds     settingUnit = "seconds"
+	unitConnections settingUnit = "connections"
+)
 
 // validatePositiveSettings checks every optional integer setting that must be positive when
 // set. Each entry names the setting as the operator spells it and the unit the error quotes.
@@ -295,6 +304,8 @@ func (s *Settings) validatePositiveSettings() error {
 		{"instance_agent_start_timeout", unitSeconds, s.InstanceAgentStartTimeout},
 		{"instance_connect_timeout", unitSeconds, s.InstanceConnectTimeout},
 		{"collector_interval", unitSeconds, s.CollectorInterval},
+		{"http_timeout", unitSeconds, s.HTTPTimeout},
+		{"http_max_idle_conns_per_host", unitConnections, s.HTTPMaxIdleConnsPerHost},
 	} {
 		if setting.value != nil && *setting.value <= 0 {
 			return fmt.Errorf("%w: %s: must be a positive number of %s", ErrSettingInvalidParameter, setting.name, setting.unit)

@@ -15,6 +15,8 @@ import (
 
 var ErrNotFound = errors.New("not found")
 
+const proxmoxUserAgent = "fleeting-plugin-proxmox"
+
 func (ig *InstanceGroup) getProxmoxPool(ctx context.Context) (*proxmox.Pool, error) {
 	pool, err := ig.proxmox.Pool(ctx, ig.Pool)
 	if err != nil {
@@ -69,19 +71,21 @@ func (ig *InstanceGroup) getProxmoxClient() (*proxmox.Client, error) {
 		return nil, err
 	}
 
-	httpClient := http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				//nolint:gosec
-				InsecureSkipVerify: ig.InsecureSkipTLSVerify,
-			},
-		},
+	transport := http.DefaultTransport.(*http.Transport).Clone() //nolint:forcetypeassert
+	transport.TLSClientConfig = &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		//nolint:gosec
+		InsecureSkipVerify: ig.InsecureSkipTLSVerify,
 	}
+	transport.MaxIdleConnsPerHost = *ig.HTTPMaxIdleConnsPerHost
 
 	return proxmox.NewClient(
 		url.JoinPath("/api2/json").String(),
 		proxmox.WithCredentials(credentials),
-		proxmox.WithHTTPClient(&httpClient),
+		proxmox.WithHTTPClient(&http.Client{Transport: transport}),
+		proxmox.WithTimeout(seconds(ig.HTTPTimeout)),
+		proxmox.WithUserAgent(proxmoxUserAgent),
+		proxmox.WithEagerAuth(),
 	), nil
 }
 

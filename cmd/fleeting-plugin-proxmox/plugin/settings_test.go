@@ -36,6 +36,8 @@ func TestSettings_fillWithDefaults(t *testing.T) {
 	require.Equal(t, 120, *settings.InstanceAgentStartTimeout)
 	require.Equal(t, 60, *settings.InstanceConnectTimeout)
 	require.Equal(t, 60, *settings.CollectorInterval)
+	require.Equal(t, 60, *settings.HTTPTimeout)
+	require.Equal(t, 8, *settings.HTTPMaxIdleConnsPerHost)
 
 	settings2 := Settings{
 		InstanceNameCreating: sampleInstanceNameCreating,
@@ -54,12 +56,16 @@ func TestSettings_fillWithDefaults_timeoutsHonoured(t *testing.T) {
 	agentStartTimeout := 222
 	connectTimeout := 333
 	collectorInterval := 444
+	httpTimeout := 555
+	httpMaxIdleConnsPerHost := 16
 
 	settings := Settings{
 		ProxmoxTaskWaitTimeout:    &taskWaitTimeout,
 		InstanceAgentStartTimeout: &agentStartTimeout,
 		InstanceConnectTimeout:    &connectTimeout,
 		CollectorInterval:         &collectorInterval,
+		HTTPTimeout:               &httpTimeout,
+		HTTPMaxIdleConnsPerHost:   &httpMaxIdleConnsPerHost,
 	}
 	settings.FillWithDefaults()
 
@@ -67,6 +73,8 @@ func TestSettings_fillWithDefaults_timeoutsHonoured(t *testing.T) {
 	require.Equal(t, agentStartTimeout, *settings.InstanceAgentStartTimeout)
 	require.Equal(t, connectTimeout, *settings.InstanceConnectTimeout)
 	require.Equal(t, collectorInterval, *settings.CollectorInterval)
+	require.Equal(t, httpTimeout, *settings.HTTPTimeout)
+	require.Equal(t, httpMaxIdleConnsPerHost, *settings.HTTPMaxIdleConnsPerHost)
 }
 
 func TestSettings_validateTimeoutSettings(t *testing.T) {
@@ -93,6 +101,8 @@ func TestSettings_validateTimeoutSettings(t *testing.T) {
 		{"instance_agent_start_timeout", func(s *Settings, v *int) { s.InstanceAgentStartTimeout = v }},
 		{"instance_connect_timeout", func(s *Settings, v *int) { s.InstanceConnectTimeout = v }},
 		{"collector_interval", func(s *Settings, v *int) { s.CollectorInterval = v }},
+		{"http_timeout", func(s *Settings, v *int) { s.HTTPTimeout = v }},
+		{"http_max_idle_conns_per_host", func(s *Settings, v *int) { s.HTTPMaxIdleConnsPerHost = v }},
 	}
 
 	for _, field := range fields {
