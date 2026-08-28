@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 
 	"github.com/luthermonson/go-proxmox"
 	"golang.org/x/sync/errgroup"
@@ -13,16 +12,28 @@ import (
 const (
 	vmOptName = "name"
 	vmOptTags = "tags"
+
+	// proxmoxResourceTypeQemu is the ClusterResource.Type / VirtualMachine.Type
+	// value Proxmox uses for QEMU VMs (as opposed to "lxc" containers etc.).
+	proxmoxResourceTypeQemu = "qemu"
 )
 
 var ErrCloneVMWithoutConfiguredStorage = errors.New("attempted to clone a VM without configured storage")
 
-func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.VirtualMachine, cloneMu *sync.Mutex) (int, error) {
-	VMID, task, err := ig.cloneTemplate(ctx, template, cloneMu)
+func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.VirtualMachine) (int, error) {
+	VMID, task, err := ig.cloneTemplate(ctx, template)
 	if err == nil {
 		ig.log.Info("Deploying new instance", "vmid", VMID)
 
 		err = ig.waitTask(ctx, task, ig.taskWaitTimeout())
+		if err != nil {
+			// The clone POST succeeded, so VMID is allocated and Proxmox rolls
+			// the target config back when the clone worker fails - but a wait
+			// that merely timed out may still land, so ReleaseIfFree reconfirms
+			// with the cluster before giving the reservation back rather than
+			// risk handing a live id to another clone.
+			ig.vmids.ReleaseIfFree(ctx, VMID)
+		}
 	}
 
 	if err != nil {
@@ -104,17 +115,23 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 	return VMID, nil
 }
 
-func (ig *InstanceGroup) cloneTemplate(ctx context.Context, template *proxmox.VirtualMachine, cloneMu *sync.Mutex) (int, *proxmox.Task, error) {
+func (ig *InstanceGroup) cloneTemplate(ctx context.Context, template *proxmox.VirtualMachine) (int, *proxmox.Task, error) {
 	cloneOptions, err := ig.getTemplateCloneOptions(template)
 	if err != nil {
 		return -1, nil, err
 	}
 
-	cloneMu.Lock()
-	defer cloneMu.Unlock()
+	vmid, err := ig.vmids.Allocate(ctx)
+	if err != nil {
+		return -1, nil, fmt.Errorf("failed to allocate a vmid for the clone: %w", err)
+	}
+
+	cloneOptions.NewID = vmid
 
 	VMID, task, err := template.Clone(ctx, cloneOptions)
 	if err != nil {
+		ig.vmids.Release(vmid)
+
 		return -1, nil, fmt.Errorf("failed to clone the template: %w", err)
 	}
 
@@ -221,5 +238,5 @@ func (ig *InstanceGroup) markInstancesForRemoval(ctx context.Context, instances 
 }
 
 func (ig *InstanceGroup) isProxmoxResourceAnInstance(member proxmox.ClusterResource) bool {
-	return member.Type == "qemu" && member.VMID != uint64(*ig.TemplateID)
+	return member.Type == proxmoxResourceTypeQemu && member.VMID != uint64(*ig.TemplateID)
 }

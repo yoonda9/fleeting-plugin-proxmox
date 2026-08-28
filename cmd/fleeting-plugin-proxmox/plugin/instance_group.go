@@ -37,6 +37,10 @@ type InstanceGroup struct {
 	log     hclog.Logger    `json:"-"`
 	proxmox *proxmox.Client `json:"-"`
 
+	// vmids allocates and reserves VMIDs for new clones so two concurrent clones
+	// can never be handed the same ID. See vmid.go.
+	vmids *vmidAllocator `json:"-"`
+
 	// This mutex is used when cloning template for new instances. It is required for blocking other
 	// operations like collection or update, because when new instance is created with recycled ID then for
 	// a brief period it will be reported from Proxmox with old name (e.g. InstanceNameRemoving).
@@ -84,6 +88,9 @@ func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings
 	if err != nil {
 		return provider.ProviderInfo{}, err
 	}
+
+	cluster := new(proxmox.Cluster).New(ig.proxmox)
+	ig.vmids = newVMIDAllocator(cluster.CheckID, cluster.NextID)
 
 	err = ig.markStaleInstancesForRemoval(ctx)
 	if err != nil {
@@ -157,9 +164,6 @@ func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 		errorGroup = new(errgroup.Group)
 
 		results = make([]deployResult, count)
-
-		// We need to mutex cloning as Proxmox will fail multiple requests in parallel
-		cloneMu = new(sync.Mutex)
 	)
 
 	ig.instanceCloningMu.Lock()
@@ -167,7 +171,7 @@ func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 
 	for index := range count {
 		errorGroup.Go(func() error {
-			vmid, err := ig.deployInstance(ctx, template, cloneMu)
+			vmid, err := ig.deployInstance(ctx, template)
 			if err != nil {
 				ig.log.Error("failed to deploy an instance", "vmid", vmid, "err", err)
 			} else {

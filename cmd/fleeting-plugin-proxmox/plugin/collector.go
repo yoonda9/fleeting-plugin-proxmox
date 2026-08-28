@@ -102,7 +102,10 @@ func (ig *InstanceGroup) collectInstance(ctx context.Context, member proxmox.Clu
 
 	if err != nil {
 		ig.log.Error("collector failed to delete instance", "vmid", member.VMID, "err", err)
+		return
 	}
+
+	ig.vmids.Release(int(member.VMID))
 }
 
 // triggerCollection wakes up the collector without blocking. The channel is a
