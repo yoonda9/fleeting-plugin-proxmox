@@ -152,3 +152,67 @@ func TestInstanceGroup_waitTaskNilTask(t *testing.T) {
 	require.NoError(t, group.waitTask(context.Background(), nil))
 	require.Regexp(t, `\[WARN\].*Proxmox returned no task to wait on`, logBuffer.String())
 }
+
+// A poll that fails transiently must not end the wait: the task is still progressing on the
+// node, and the blip is the API in front of it. Both spellings of a loaded pveproxy are
+// covered, because they reach classifyError by different routes.
+func TestInstanceGroup_waitTaskKeepsWaitingThroughTransientPolls(t *testing.T) {
+	testCases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{
+			// A 502 with a non-JSON (HTML) body surfaces to the plugin as a JSON decode error
+			// rather than a typed status; classifyError must still treat it as transient.
+			name:   "502 with an HTML body",
+			status: http.StatusBadGateway,
+			body:   "<html>Bad Gateway</html>",
+		},
+		{
+			// A bare 500: go-proxmox's handleResponse returns errors.New(res.Status) for it
+			// without ever reading the body, so this is a genuine status-based classification.
+			// A valid JSON body proves that -- were classifyError relying on a decode failure
+			// instead, this case would not classify as transient and the wait would give up.
+			name:   "500 with a valid JSON body",
+			status: http.StatusInternalServerError,
+			body:   `{"data":{"result":"ok"}}`,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var requests atomic.Int64
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasSuffix(r.URL.Path, "/status") {
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+
+					return
+				}
+
+				// The first two polls fail; the third reports the task done.
+				if requests.Add(1) <= 2 {
+					w.WriteHeader(testCase.status)
+					fmt.Fprint(w, testCase.body)
+
+					return
+				}
+
+				fmt.Fprint(w, taskStatusBody("qmclone", taskStatusStopped, taskExitStatusOK))
+			}))
+			defer server.Close()
+
+			task := proxmox.NewTask(testTaskUPID, proxmox.NewClient(server.URL))
+
+			ig := newWaitTestGroup()
+			*ig.ProxmoxTaskWaitTimeout = 5
+
+			require.NoError(t, ig.waitTask(context.Background(), task))
+			require.GreaterOrEqual(t, requests.Load(), int64(3))
+		})
+	}
+}
