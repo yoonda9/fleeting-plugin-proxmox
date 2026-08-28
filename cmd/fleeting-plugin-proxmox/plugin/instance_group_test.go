@@ -148,9 +148,10 @@ const (
 	increaseTestTemplateID = 200
 )
 
-// increaseTestCloneVMIDs are the vmids /cluster/nextid hands out, in order. Increase
-// serialises the nextid/clone pair under its clone mutex, so the first of these is always the
-// one whose clone POST is refused and the second is always the one that deploys.
+// increaseTestCloneVMIDs are the vmids /cluster/nextid hands out, in order. The allocator
+// serialises its nextid/check pair, so each is handed out exactly once, but the two clone
+// POSTs then race: which of them is the refused one is the scheduler's choice, and nothing
+// below depends on it.
 var increaseTestCloneVMIDs = []int{100, 101}
 
 // increaseTestUPID builds the UPID of a task of the given type against a vmid on the fake
@@ -233,7 +234,14 @@ func newIncreaseTestGroup(t *testing.T, log hclog.Logger) *InstanceGroup {
 		fmt.Fprintf(w, `{"data":%q}`, increaseTestUPID("qmstart", increaseTestVMID(t, r)))
 	})
 
-	mux.HandleFunc("GET /cluster/nextid", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /cluster/nextid", func(w http.ResponseWriter, r *http.Request) {
+		// With a vmid parameter this is the allocator's free check, and every id is free.
+		if vmid := r.URL.Query().Get("vmid"); vmid != "" {
+			fmt.Fprintf(w, `{"data":%q}`, vmid)
+
+			return
+		}
+
 		index := int(vmidsHandedOut.Add(1)) - 1
 		if index >= len(increaseTestCloneVMIDs) {
 			t.Errorf("fake was asked for more vmids than the %d it has", len(increaseTestCloneVMIDs))
@@ -295,6 +303,8 @@ func newIncreaseTestGroup(t *testing.T, log hclog.Logger) *InstanceGroup {
 	ig.InstanceTagsRunning = "fleeting-running"
 	ig.log = log
 	ig.proxmox = proxmox.NewClient(server.URL)
+
+	ig.vmids = ig.clusterVMIDAllocator()
 
 	return ig
 }
