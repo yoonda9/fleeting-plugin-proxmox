@@ -66,7 +66,7 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 		}
 
 		// Wait for agent to start
-		err = vm.WaitForAgent(ctx, *ig.InstanceAgentStartTimeout)
+		err = ig.waitForAgent(ctx, vm)
 		if err != nil {
 			return fmt.Errorf("failed when waiting for qemu agent to start on newly deployed instance: %w", err)
 		}

@@ -38,6 +38,7 @@ func TestSettings_fillWithDefaults(t *testing.T) {
 	require.Equal(t, 60, *settings.CollectorInterval)
 	require.Equal(t, 60, *settings.HTTPTimeout)
 	require.Equal(t, 8, *settings.HTTPMaxIdleConnsPerHost)
+	require.Equal(t, 3, *settings.ProxmoxAPIRetryAttempts)
 
 	settings2 := Settings{
 		InstanceNameCreating: sampleInstanceNameCreating,
@@ -58,6 +59,7 @@ func TestSettings_fillWithDefaults_timeoutsHonoured(t *testing.T) {
 	collectorInterval := 444
 	httpTimeout := 555
 	httpMaxIdleConnsPerHost := 16
+	proxmoxAPIRetryAttempts := 5
 
 	settings := Settings{
 		ProxmoxTaskWaitTimeout:    &taskWaitTimeout,
@@ -66,6 +68,7 @@ func TestSettings_fillWithDefaults_timeoutsHonoured(t *testing.T) {
 		CollectorInterval:         &collectorInterval,
 		HTTPTimeout:               &httpTimeout,
 		HTTPMaxIdleConnsPerHost:   &httpMaxIdleConnsPerHost,
+		ProxmoxAPIRetryAttempts:   &proxmoxAPIRetryAttempts,
 	}
 	settings.FillWithDefaults()
 
@@ -75,6 +78,7 @@ func TestSettings_fillWithDefaults_timeoutsHonoured(t *testing.T) {
 	require.Equal(t, collectorInterval, *settings.CollectorInterval)
 	require.Equal(t, httpTimeout, *settings.HTTPTimeout)
 	require.Equal(t, httpMaxIdleConnsPerHost, *settings.HTTPMaxIdleConnsPerHost)
+	require.Equal(t, proxmoxAPIRetryAttempts, *settings.ProxmoxAPIRetryAttempts)
 }
 
 func TestSettings_validateTimeoutSettings(t *testing.T) {
@@ -159,6 +163,32 @@ func TestSettings_validateHTTPMaxIdleConnsPerHost(t *testing.T) {
 			settings := &Settings{HTTPMaxIdleConnsPerHost: tt.value}
 
 			err := settings.validateHTTPMaxIdleConnsPerHost()
+			require.ErrorIs(t, err, tt.expectedError)
+		})
+	}
+}
+
+func TestSettings_validateProxmoxAPIRetryAttempts(t *testing.T) {
+	negative := -1
+	zero := 0
+	positive := 5
+
+	tests := []struct {
+		name          string
+		value         *int
+		expectedError error
+	}{
+		{"unset is valid", nil, nil},
+		{"positive is valid", &positive, nil},
+		{"zero is invalid", &zero, ErrSettingInvalidParameter},
+		{"negative is invalid", &negative, ErrSettingInvalidParameter},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings := &Settings{ProxmoxAPIRetryAttempts: tt.value}
+
+			err := settings.validateProxmoxAPIRetryAttempts()
 			require.ErrorIs(t, err, tt.expectedError)
 		})
 	}
@@ -299,6 +329,19 @@ func TestSettings_checkRequiredFields(t *testing.T) {
 				TemplateID:              &sampleTemplateID,
 				MaxInstances:            &sampleMaxInstances,
 				HTTPMaxIdleConnsPerHost: &sampleInvalidTimeout,
+			},
+			expectedError: ErrSettingInvalidParameter,
+		},
+		{
+			name: "Invalid proxmox api retry attempts",
+			settings: Settings{
+				URL:                     sampleURL,
+				CredentialsFilePath:     sampleCredentialsPath,
+				Pool:                    samplePool,
+				Storage:                 sampleStorage,
+				TemplateID:              &sampleTemplateID,
+				MaxInstances:            &sampleMaxInstances,
+				ProxmoxAPIRetryAttempts: &sampleInvalidTimeout,
 			},
 			expectedError: ErrSettingInvalidParameter,
 		},

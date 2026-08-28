@@ -309,8 +309,17 @@ func (ig *InstanceGroup) Heartbeat(ctx context.Context, instance string) error {
 		return err
 	}
 
-	// Returns an error if the QEMU agent is not communicating due to an empty result
-	_, err = vm.AgentOsInfo(ctx)
+	// Tolerate transient blips (a busy node, a dropped connection) rather than
+	// declaring a healthy instance unhealthy mid-job on the first bad poll.
+	err = retryIdempotent(ctx, *ig.ProxmoxAPIRetryAttempts, proxmoxRetryBackoff, func() error {
+		_, err := vm.AgentOsInfo(ctx)
+
+		// classifyError (inside retryIdempotent) needs the raw go-proxmox error to
+		// recognize a transient 500/501 - wrapping it here would hide that from the
+		// prefix match. The final result is wrapped below instead.
+		//nolint:wrapcheck
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("failed to connect to qemu agent '%s': %w", instance, err)
 	}

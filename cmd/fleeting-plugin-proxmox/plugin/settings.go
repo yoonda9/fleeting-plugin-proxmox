@@ -42,6 +42,7 @@ const (
 	DefaultCollectorInterval         int = 60
 	DefaultHTTPTimeout               int = 60
 	DefaultHTTPMaxIdleConnsPerHost   int = 8
+	DefaultProxmoxAPIRetryAttempts   int = 3
 )
 
 // Disk index limits for each disk type.
@@ -125,6 +126,9 @@ type Settings struct {
 
 	// Maximum idle HTTP connections to keep open per Proxmox VE host.
 	HTTPMaxIdleConnsPerHost *int `json:"http_max_idle_conns_per_host"`
+
+	// How many times to retry a read-only Proxmox API call that failed transiently.
+	ProxmoxAPIRetryAttempts *int `json:"proxmox_api_retry_attempts"`
 }
 
 func (s *Settings) FillWithDefaults() {
@@ -182,6 +186,11 @@ func (s *Settings) FillWithDefaults() {
 		s.HTTPMaxIdleConnsPerHost = new(int)
 		*s.HTTPMaxIdleConnsPerHost = DefaultHTTPMaxIdleConnsPerHost
 	}
+
+	if s.ProxmoxAPIRetryAttempts == nil {
+		s.ProxmoxAPIRetryAttempts = new(int)
+		*s.ProxmoxAPIRetryAttempts = DefaultProxmoxAPIRetryAttempts
+	}
 }
 
 func (s *Settings) CheckRequiredFields() error {
@@ -205,6 +214,7 @@ func (s *Settings) CheckRequiredFields() error {
 		{"collector_interval", s.validateCollectorInterval},
 		{"http_timeout", s.validateHTTPTimeout},
 		{"http_max_idle_conns_per_host", s.validateHTTPMaxIdleConnsPerHost},
+		{"proxmox_api_retry_attempts", s.validateProxmoxAPIRetryAttempts},
 	}
 
 	for _, v := range validators {
@@ -349,6 +359,11 @@ func validatePositiveInt(name string, value *int) error {
 // validateHTTPMaxIdleConnsPerHost checks that the max idle conns per host, if set, is positive.
 func (s *Settings) validateHTTPMaxIdleConnsPerHost() error {
 	return validatePositiveInt("http_max_idle_conns_per_host", s.HTTPMaxIdleConnsPerHost)
+}
+
+// validateProxmoxAPIRetryAttempts checks that the retry attempts count, if set, is positive.
+func (s *Settings) validateProxmoxAPIRetryAttempts() error {
+	return validatePositiveInt("proxmox_api_retry_attempts", s.ProxmoxAPIRetryAttempts)
 }
 
 // getDiskMaxIndex returns the maximum valid index for a given disk type.
