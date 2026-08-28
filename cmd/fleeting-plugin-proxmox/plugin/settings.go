@@ -129,6 +129,14 @@ type Settings struct {
 
 	// How many times to retry a read-only Proxmox API call that failed transiently.
 	ProxmoxAPIRetryAttempts *int `json:"proxmox_api_retry_attempts"`
+
+	// Start (inclusive) of a dedicated VMID range for this manager. Unset uses
+	// /cluster/nextid instead. Must be set together with VMIDRangeEnd.
+	VMIDRangeStart *int `json:"vmid_range_start,omitempty"`
+
+	// End (exclusive) of a dedicated VMID range for this manager. Unset uses
+	// /cluster/nextid instead. Must be set together with VMIDRangeStart.
+	VMIDRangeEnd *int `json:"vmid_range_end,omitempty"`
 }
 
 func (s *Settings) FillWithDefaults() {
@@ -203,6 +211,7 @@ func (s *Settings) CheckRequiredFields() error {
 		{"credentials_file_path", s.validateCredentialsFilePath},
 		{"pool", s.validatePool},
 		{"template_id", s.validateTemplateID},
+		{"vmid_range", s.validateVMIDRange},
 		{"max_instances", s.validateMaxInstances},
 		{"instance_network_protocol", s.validateInstanceNetworkProtocol},
 		{"instance_autoresize_disk", s.validateInstanceAutoresizeDisk},
@@ -258,6 +267,32 @@ func (s *Settings) validatePool() error {
 func (s *Settings) validateTemplateID() error {
 	if s.TemplateID == nil {
 		return fmt.Errorf("%w: template_id", ErrRequiredSettingMissing)
+	}
+
+	return nil
+}
+
+// validateVMIDRange checks that vmid_range_start and vmid_range_end, if either is
+// set, are both set, form a non-empty range (start < end), and exclude
+// template_id. CheckRequiredFields runs validateTemplateID immediately before
+// this validator, so TemplateID is guaranteed non-nil here.
+func (s *Settings) validateVMIDRange() error {
+	if s.VMIDRangeStart == nil && s.VMIDRangeEnd == nil {
+		return nil
+	}
+
+	if s.VMIDRangeStart == nil || s.VMIDRangeEnd == nil {
+		return fmt.Errorf("%w: vmid_range_start and vmid_range_end must both be set, or both left unset",
+			ErrSettingInvalidParameter)
+	}
+
+	if *s.VMIDRangeStart >= *s.VMIDRangeEnd {
+		return fmt.Errorf("%w: vmid_range_start must be less than vmid_range_end", ErrSettingInvalidParameter)
+	}
+
+	if *s.TemplateID >= *s.VMIDRangeStart && *s.TemplateID < *s.VMIDRangeEnd {
+		return fmt.Errorf("%w: vmid_range_start..vmid_range_end must not contain template_id",
+			ErrSettingInvalidParameter)
 	}
 
 	return nil

@@ -90,7 +90,12 @@ func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings
 	}
 
 	cluster := new(proxmox.Cluster).New(ig.proxmox)
-	ig.vmids = newVMIDAllocator(cluster.CheckID, cluster.NextID)
+	if ig.VMIDRangeStart != nil {
+		// validateVMIDRange guarantees VMIDRangeEnd is also set here.
+		ig.vmids = newVMIDAllocatorRange(cluster.CheckID, *ig.VMIDRangeStart, *ig.VMIDRangeEnd)
+	} else {
+		ig.vmids = newVMIDAllocator(cluster.CheckID, cluster.NextID)
+	}
 
 	err = ig.markStaleInstancesForRemoval(ctx)
 	if err != nil {

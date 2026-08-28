@@ -16,12 +16,16 @@ import (
 // candidate+1, ...), spending its checkID round trips on genuinely different
 // IDs. This bounds a burst of N concurrent Allocate calls to
 // min(N, vmidAllocateAttempts) successes instead of degrading toward a single
-// success; a call only fails once
-// vmidAllocateAttempts consecutive candidates starting there are all taken,
-// locally or on the cluster.
+// success; a call only fails once vmidAllocateAttempts consecutive candidates
+// starting there are all taken, locally or on the cluster.
 const vmidAllocateAttempts = 10
 
-var ErrVMIDAllocationFailed = errors.New("failed to allocate a free vmid")
+var (
+	ErrVMIDAllocationFailed = errors.New("failed to allocate a free vmid")
+	// ErrVMIDExhausted is returned in range mode when every ID in [lo, hi) is
+	// either reserved locally or reported taken by the cluster.
+	ErrVMIDExhausted = errors.New("vmid range exhausted")
+)
 
 // vmidAllocator hands out VMIDs for new clones and keeps a local reservation set so
 // two concurrent Allocate calls in this process can never be handed the same ID.
@@ -34,9 +38,21 @@ var ErrVMIDAllocationFailed = errors.New("failed to allocate a free vmid")
 //
 // checkID and nextID are injected so the allocator is unit-testable without a live
 // Proxmox API.
+//
+// Two modes, chosen by lo/hi:
+//   - nextid mode (lo == hi, the zero value): candidates come from nextID, see
+//     allocateNextID.
+//   - range mode (hi > lo): candidates come from a forward-only wrapping cursor
+//     over [lo, hi), see allocateFromRange. /cluster/nextid always returns the
+//     lowest free ID, so a just-deleted ID comes straight back; the cursor
+//     only moves forward, so a freed ID is not reissued until the range wraps
+//     around - which is what actually defuses that recycling window.
 type vmidAllocator struct {
 	mu       sync.Mutex
 	reserved map[int]struct{}
+
+	lo, hi int // lo == hi → nextid mode; hi > lo → range mode over [lo, hi)
+	cursor int // next candidate to try in range mode, monotonic within [lo, hi), wraps to lo
 
 	checkID func(ctx context.Context, vmid int) (bool, error)
 	nextID  func(ctx context.Context) (int, error)
@@ -53,6 +69,22 @@ func newVMIDAllocator(
 	}
 }
 
+// newVMIDAllocatorRange builds an allocator confined to the dedicated range
+// [rangeStart, rangeEnd). The caller must ensure rangeStart < rangeEnd
+// (Settings.validateVMIDRange enforces this before Init wires it up).
+func newVMIDAllocatorRange(
+	checkID func(ctx context.Context, vmid int) (bool, error),
+	rangeStart, rangeEnd int,
+) *vmidAllocator {
+	return &vmidAllocator{
+		reserved: make(map[int]struct{}),
+		checkID:  checkID,
+		lo:       rangeStart,
+		hi:       rangeEnd,
+		cursor:   rangeStart,
+	}
+}
+
 // Allocate reserves and returns a VMID that is not currently reserved by this
 // allocator. The caller must pass the result as an explicit NewID on the clone
 // request and call Release if the clone POST fails or once the collector confirms
@@ -61,33 +93,11 @@ func (a *vmidAllocator) Allocate(ctx context.Context) (int, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	candidate, err := a.nextID(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get next free vmid: %w", err)
+	if a.hi > a.lo {
+		return a.allocateFromRange(ctx)
 	}
 
-	for attempt := range vmidAllocateAttempts {
-		vmid := candidate + attempt
-
-		if _, taken := a.reserved[vmid]; taken {
-			continue
-		}
-
-		free, err := a.checkID(ctx, vmid)
-		if err != nil {
-			return 0, fmt.Errorf("failed to check vmid='%d': %w", vmid, err)
-		}
-
-		if !free {
-			continue
-		}
-
-		a.reserved[vmid] = struct{}{}
-
-		return vmid, nil
-	}
-
-	return 0, ErrVMIDAllocationFailed
+	return a.allocateNextID(ctx)
 }
 
 // Release returns vmid to the pool of allocatable IDs. Releasing a vmid that is
@@ -135,4 +145,75 @@ func (a *vmidAllocator) ReleaseIfFree(ctx context.Context, vmid int) {
 	}
 
 	delete(a.reserved, vmid)
+}
+
+// allocateNextID implements nextid mode: ask the cluster for its lowest free
+// ID once, then walk candidates forward locally on a collision instead of
+// repeating the same nextID call - see vmidAllocateAttempts' doc comment for
+// why. Caller holds a.mu.
+func (a *vmidAllocator) allocateNextID(ctx context.Context) (int, error) {
+	candidate, err := a.nextID(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get next free vmid: %w", err)
+	}
+
+	for attempt := range vmidAllocateAttempts {
+		vmid := candidate + attempt
+
+		if _, taken := a.reserved[vmid]; taken {
+			continue
+		}
+
+		free, err := a.checkID(ctx, vmid)
+		if err != nil {
+			return 0, fmt.Errorf("failed to check vmid='%d': %w", vmid, err)
+		}
+
+		if !free {
+			continue
+		}
+
+		a.reserved[vmid] = struct{}{}
+
+		return vmid, nil
+	}
+
+	return 0, ErrVMIDAllocationFailed
+}
+
+// allocateFromRange implements range mode: advance the cursor from its last
+// position, skipping locally reserved IDs, confirming everything else with
+// checkID ("free at time of check"). The cursor wraps at hi back to lo and
+// never resets on Release, so a whole pass over [lo, hi) is the bound on how
+// long a single Allocate call can take. Caller holds a.mu.
+func (a *vmidAllocator) allocateFromRange(ctx context.Context) (int, error) {
+	span := a.hi - a.lo
+
+	for range span {
+		vmid := a.cursor
+
+		a.cursor++
+		if a.cursor >= a.hi {
+			a.cursor = a.lo
+		}
+
+		if _, taken := a.reserved[vmid]; taken {
+			continue
+		}
+
+		free, err := a.checkID(ctx, vmid)
+		if err != nil {
+			return 0, fmt.Errorf("failed to check vmid='%d': %w", vmid, err)
+		}
+
+		if !free {
+			continue
+		}
+
+		a.reserved[vmid] = struct{}{}
+
+		return vmid, nil
+	}
+
+	return 0, ErrVMIDExhausted
 }

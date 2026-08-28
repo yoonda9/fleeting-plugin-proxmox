@@ -208,6 +208,111 @@ func TestVMIDAllocator_allocatePropagatesCheckIDError(t *testing.T) {
 	require.ErrorIs(t, err, wantErr)
 }
 
+// TestVMIDAllocator_rangeAllocateNoReissueBeforeWrap is a regression
+// test: /cluster/nextid always returns the lowest free ID, so a nextid-mode
+// allocator would hand a just-released ID straight back out. Range mode's
+// forward-only cursor must not do that until the cursor actually wraps.
+func TestVMIDAllocator_rangeAllocateNoReissueBeforeWrap(t *testing.T) {
+	allocator := newVMIDAllocatorRange(alwaysFreeCheckID, 100, 103)
+
+	first, err := allocator.Allocate(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 100, first)
+
+	allocator.Release(first)
+
+	second, err := allocator.Allocate(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 101, second, "a freed id must not be reissued before the cursor wraps")
+}
+
+// TestVMIDAllocator_rangeAllocateWrapsAround proves the cursor comes back to lo
+// once it passes hi, and that it picks up the released id on the way round.
+func TestVMIDAllocator_rangeAllocateWrapsAround(t *testing.T) {
+	allocator := newVMIDAllocatorRange(alwaysFreeCheckID, 100, 102)
+
+	first, err := allocator.Allocate(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 100, first)
+
+	second, err := allocator.Allocate(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 101, second)
+
+	allocator.Release(first)
+
+	// The range is fully reserved except 100 (just released); the cursor must
+	// wrap past hi=102 back to lo=100 to find it.
+	third, err := allocator.Allocate(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 100, third)
+}
+
+// TestVMIDAllocator_rangeAllocateSkipsLocallyReservedIDs proves an id already
+// reserved by an earlier, still-outstanding Allocate call is never handed out
+// again by a later call, even though checkID alone would report it free (the
+// cluster has no idea about a purely local reservation).
+func TestVMIDAllocator_rangeAllocateSkipsLocallyReservedIDs(t *testing.T) {
+	allocator := newVMIDAllocatorRange(alwaysFreeCheckID, 100, 102)
+
+	first, err := allocator.Allocate(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 100, first)
+
+	second, err := allocator.Allocate(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 101, second)
+
+	// Both ids in the range are still reserved (never released): a third call
+	// must exhaust rather than reissue either one.
+	_, err = allocator.Allocate(context.Background())
+	require.ErrorIs(t, err, ErrVMIDExhausted)
+}
+
+// TestVMIDAllocator_rangeAllocateExhaustionReturnsErrVMIDExhausted covers a range
+// that is entirely reserved locally or taken on the cluster: Allocate must give
+// up after one full pass over [lo, hi) rather than looping forever.
+func TestVMIDAllocator_rangeAllocateExhaustionReturnsErrVMIDExhausted(t *testing.T) {
+	neverFreeCheckID := func(context.Context, int) (bool, error) {
+		return false, nil
+	}
+
+	allocator := newVMIDAllocatorRange(neverFreeCheckID, 100, 103)
+
+	_, err := allocator.Allocate(context.Background())
+	require.ErrorIs(t, err, ErrVMIDExhausted)
+}
+
+// TestVMIDAllocator_rangeAllocateSkipsIDsRejectedByCheckID proves candidates
+// already present on the cluster (checkID reports taken) are skipped without
+// being reserved, and the cursor keeps advancing past them.
+func TestVMIDAllocator_rangeAllocateSkipsIDsRejectedByCheckID(t *testing.T) {
+	checkID := func(_ context.Context, vmid int) (bool, error) {
+		// 100 already exists on the cluster outside this allocator's bookkeeping.
+		return vmid != 100, nil
+	}
+
+	allocator := newVMIDAllocatorRange(checkID, 100, 103)
+
+	vmid, err := allocator.Allocate(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 101, vmid)
+
+	_, taken := allocator.reserved[100]
+	require.False(t, taken, "a checkID-rejected id must not be reserved")
+}
+
+func TestVMIDAllocator_rangeAllocatePropagatesCheckIDError(t *testing.T) {
+	wantErr := errors.New("checkid unavailable")
+
+	allocator := newVMIDAllocatorRange(func(context.Context, int) (bool, error) {
+		return false, wantErr
+	}, 100, 103)
+
+	_, err := allocator.Allocate(context.Background())
+	require.ErrorIs(t, err, wantErr)
+}
+
 // TestVMIDAllocator_releaseIfFree is a regression test: ReleaseIfFree exists
 // only to behave differently from Release when the cluster still reports the
 // id as taken, so that difference needs its own coverage rather than relying

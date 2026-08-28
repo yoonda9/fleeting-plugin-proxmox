@@ -194,6 +194,44 @@ func TestSettings_validateProxmoxAPIRetryAttempts(t *testing.T) {
 	}
 }
 
+func TestSettings_validateVMIDRange(t *testing.T) {
+	var (
+		templateID = 20
+		start100   = 100
+		end200     = 200
+		end100     = 100 // equal to start100, an empty range
+		start20    = 20  // equal to templateID
+		end21      = 21
+	)
+
+	tests := []struct {
+		name          string
+		start, end    *int
+		expectedError error
+	}{
+		{"both unset is valid", nil, nil, nil},
+		{"both set, start < end, excludes template is valid", &start100, &end200, nil},
+		{"only start set is invalid", &start100, nil, ErrSettingInvalidParameter},
+		{"only end set is invalid", nil, &end200, ErrSettingInvalidParameter},
+		{"start == end is invalid", &start100, &end100, ErrSettingInvalidParameter},
+		{"start > end is invalid", &end200, &start100, ErrSettingInvalidParameter},
+		{"range containing template_id is invalid", &start20, &end21, ErrSettingInvalidParameter},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings := &Settings{
+				TemplateID:     &templateID,
+				VMIDRangeStart: tt.start,
+				VMIDRangeEnd:   tt.end,
+			}
+
+			err := settings.validateVMIDRange()
+			require.ErrorIs(t, err, tt.expectedError)
+		})
+	}
+}
+
 func TestSettings_checkRequiredFields(t *testing.T) {
 	tests := []struct {
 		name          string
