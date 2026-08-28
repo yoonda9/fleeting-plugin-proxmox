@@ -31,8 +31,11 @@ func classifyTask(status, exitStatus string) error {
 	return fmt.Errorf("%w: %s", ErrTaskFailed, exitStatus)
 }
 
-// timeout is a parameter, not a constant, because instances.go and collector.go pass different
-// timeouts (proxmoxTaskWaitTimeout vs collectionTimeout) even though both happen to be 5 minutes today.
+// taskWaitTimeout returns the configured Proxmox task wait timeout as a Duration.
+func (ig *InstanceGroup) taskWaitTimeout() time.Duration {
+	return time.Duration(*ig.ProxmoxTaskWaitTimeout) * time.Second
+}
+
 func (ig *InstanceGroup) waitTask(ctx context.Context, task *proxmox.Task, timeout time.Duration) error {
 	interval := time.Duration(*ig.ProxmoxTaskWaitInterval) * time.Second
 

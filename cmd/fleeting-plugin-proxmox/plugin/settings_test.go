@@ -18,6 +18,7 @@ var (
 	sampleInstanceNameCreating = "proxmox-creating"
 	sampleInstanceNameRunning  = "running-prox"
 	sampleInstanceNameRemoving = "proxve-removing"
+	sampleInvalidTimeout       = 0
 )
 
 func TestSettings_fillWithDefaults(t *testing.T) {
@@ -31,6 +32,10 @@ func TestSettings_fillWithDefaults(t *testing.T) {
 	require.Equal(t, "fleeting-removing", settings.InstanceNameRemoving)
 	require.Equal(t, "ipv4", settings.InstanceNetworkProtocol)
 	require.Equal(t, 10, *settings.ProxmoxTaskWaitInterval)
+	require.Equal(t, 300, *settings.ProxmoxTaskWaitTimeout)
+	require.Equal(t, 120, *settings.InstanceAgentStartTimeout)
+	require.Equal(t, 60, *settings.InstanceConnectTimeout)
+	require.Equal(t, 60, *settings.CollectorInterval)
 
 	settings2 := Settings{
 		InstanceNameCreating: sampleInstanceNameCreating,
@@ -42,6 +47,82 @@ func TestSettings_fillWithDefaults(t *testing.T) {
 	require.Equal(t, sampleInstanceNameCreating, settings2.InstanceNameCreating)
 	require.Equal(t, sampleInstanceNameRunning, settings2.InstanceNameRunning)
 	require.Equal(t, sampleInstanceNameRemoving, settings2.InstanceNameRemoving)
+}
+
+func TestSettings_fillWithDefaults_timeoutsHonoured(t *testing.T) {
+	taskWaitTimeout := 111
+	agentStartTimeout := 222
+	connectTimeout := 333
+	collectorInterval := 444
+
+	settings := Settings{
+		ProxmoxTaskWaitTimeout:    &taskWaitTimeout,
+		InstanceAgentStartTimeout: &agentStartTimeout,
+		InstanceConnectTimeout:    &connectTimeout,
+		CollectorInterval:         &collectorInterval,
+	}
+	settings.FillWithDefaults()
+
+	require.Equal(t, taskWaitTimeout, *settings.ProxmoxTaskWaitTimeout)
+	require.Equal(t, agentStartTimeout, *settings.InstanceAgentStartTimeout)
+	require.Equal(t, connectTimeout, *settings.InstanceConnectTimeout)
+	require.Equal(t, collectorInterval, *settings.CollectorInterval)
+}
+
+func TestSettings_validateTimeoutSettings(t *testing.T) {
+	negative := -1
+	zero := 0
+	positive := 30
+
+	tests := []struct {
+		name          string
+		value         *int
+		expectedError error
+	}{
+		{"unset is valid", nil, nil},
+		{"positive is valid", &positive, nil},
+		{"zero is invalid", &zero, ErrSettingInvalidParameter},
+		{"negative is invalid", &negative, ErrSettingInvalidParameter},
+	}
+
+	fields := []struct {
+		name     string
+		setValue func(*Settings, *int)
+		validate func(*Settings) error
+	}{
+		{
+			"proxmox_task_wait_timeout",
+			func(s *Settings, v *int) { s.ProxmoxTaskWaitTimeout = v },
+			(*Settings).validateProxmoxTaskWaitTimeout,
+		},
+		{
+			"instance_agent_start_timeout",
+			func(s *Settings, v *int) { s.InstanceAgentStartTimeout = v },
+			(*Settings).validateInstanceAgentStartTimeout,
+		},
+		{
+			"instance_connect_timeout",
+			func(s *Settings, v *int) { s.InstanceConnectTimeout = v },
+			(*Settings).validateInstanceConnectTimeout,
+		},
+		{
+			"collector_interval",
+			func(s *Settings, v *int) { s.CollectorInterval = v },
+			(*Settings).validateCollectorInterval,
+		},
+	}
+
+	for _, field := range fields {
+		for _, tt := range tests {
+			t.Run(field.name+"/"+tt.name, func(t *testing.T) {
+				settings := &Settings{}
+				field.setValue(settings, tt.value)
+
+				err := field.validate(settings)
+				require.ErrorIs(t, err, tt.expectedError)
+			})
+		}
+	}
 }
 
 func TestSettings_checkRequiredFields(t *testing.T) {
@@ -140,6 +221,19 @@ func TestSettings_checkRequiredFields(t *testing.T) {
 				TemplateID:              &sampleTemplateID,
 				MaxInstances:            &sampleMaxInstances,
 				InstanceNetworkProtocol: "invalid-protocol",
+			},
+			expectedError: ErrSettingInvalidParameter,
+		},
+		{
+			name: "Invalid collector interval",
+			settings: Settings{
+				URL:                 sampleURL,
+				CredentialsFilePath: sampleCredentialsPath,
+				Pool:                samplePool,
+				Storage:             sampleStorage,
+				TemplateID:          &sampleTemplateID,
+				MaxInstances:        &sampleMaxInstances,
+				CollectorInterval:   &sampleInvalidTimeout,
 			},
 			expectedError: ErrSettingInvalidParameter,
 		},

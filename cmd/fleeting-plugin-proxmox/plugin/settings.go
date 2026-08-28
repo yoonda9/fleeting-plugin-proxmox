@@ -35,7 +35,11 @@ const (
 	DefaultInstanceNameRunning  = "fleeting-running"
 	DefaultInstanceNameRemoving = "fleeting-removing"
 
-	DefaultProxmoxTaskWaitInterval int = 10
+	DefaultProxmoxTaskWaitInterval   int = 10
+	DefaultProxmoxTaskWaitTimeout    int = 300
+	DefaultInstanceAgentStartTimeout int = 120
+	DefaultInstanceConnectTimeout    int = 60
+	DefaultCollectorInterval         int = 60
 )
 
 // Disk index limits for each disk type.
@@ -101,6 +105,18 @@ type Settings struct {
 
 	// How often should task status be queried
 	ProxmoxTaskWaitInterval *int `json:"proxmox_task_wait_interval"`
+
+	// How long to wait for a Proxmox task (clone, resize, start, stop, delete) to complete.
+	ProxmoxTaskWaitTimeout *int `json:"proxmox_task_wait_timeout"`
+
+	// How long to wait for the QEMU guest agent to start on a newly deployed instance.
+	InstanceAgentStartTimeout *int `json:"instance_agent_start_timeout"`
+
+	// How long to wait for a newly deployed instance to report a usable network address.
+	InstanceConnectTimeout *int `json:"instance_connect_timeout"`
+
+	// How often the collector polls for instances to remove.
+	CollectorInterval *int `json:"collector_interval"`
 }
 
 func (s *Settings) FillWithDefaults() {
@@ -128,6 +144,26 @@ func (s *Settings) FillWithDefaults() {
 		s.ProxmoxTaskWaitInterval = new(int)
 		*s.ProxmoxTaskWaitInterval = DefaultProxmoxTaskWaitInterval
 	}
+
+	if s.ProxmoxTaskWaitTimeout == nil {
+		s.ProxmoxTaskWaitTimeout = new(int)
+		*s.ProxmoxTaskWaitTimeout = DefaultProxmoxTaskWaitTimeout
+	}
+
+	if s.InstanceAgentStartTimeout == nil {
+		s.InstanceAgentStartTimeout = new(int)
+		*s.InstanceAgentStartTimeout = DefaultInstanceAgentStartTimeout
+	}
+
+	if s.InstanceConnectTimeout == nil {
+		s.InstanceConnectTimeout = new(int)
+		*s.InstanceConnectTimeout = DefaultInstanceConnectTimeout
+	}
+
+	if s.CollectorInterval == nil {
+		s.CollectorInterval = new(int)
+		*s.CollectorInterval = DefaultCollectorInterval
+	}
 }
 
 func (s *Settings) CheckRequiredFields() error {
@@ -145,6 +181,10 @@ func (s *Settings) CheckRequiredFields() error {
 		{"instance_autoresize_disk", s.validateInstanceAutoresizeDisk},
 		{"instance_autoresize_size", s.validateInstanceAutoresizeSize},
 		{"instance_autoresize_consistency", s.validateInstanceAutoresizeConsistency},
+		{"proxmox_task_wait_timeout", s.validateProxmoxTaskWaitTimeout},
+		{"instance_agent_start_timeout", s.validateInstanceAgentStartTimeout},
+		{"instance_connect_timeout", s.validateInstanceConnectTimeout},
+		{"collector_interval", s.validateCollectorInterval},
 	}
 
 	for _, v := range validators {
@@ -241,6 +281,35 @@ func (s *Settings) validateInstanceAutoresizeDisk() error {
 	}
 
 	return nil
+}
+
+// validatePositiveSeconds checks that an optional seconds-denominated setting, if set, is positive.
+func validatePositiveSeconds(name string, value *int) error {
+	if value != nil && *value <= 0 {
+		return fmt.Errorf("%w: %s: must be a positive number of seconds", ErrSettingInvalidParameter, name)
+	}
+
+	return nil
+}
+
+// validateProxmoxTaskWaitTimeout checks that the task wait timeout, if set, is positive.
+func (s *Settings) validateProxmoxTaskWaitTimeout() error {
+	return validatePositiveSeconds("proxmox_task_wait_timeout", s.ProxmoxTaskWaitTimeout)
+}
+
+// validateInstanceAgentStartTimeout checks that the agent start timeout, if set, is positive.
+func (s *Settings) validateInstanceAgentStartTimeout() error {
+	return validatePositiveSeconds("instance_agent_start_timeout", s.InstanceAgentStartTimeout)
+}
+
+// validateInstanceConnectTimeout checks that the connect timeout, if set, is positive.
+func (s *Settings) validateInstanceConnectTimeout() error {
+	return validatePositiveSeconds("instance_connect_timeout", s.InstanceConnectTimeout)
+}
+
+// validateCollectorInterval checks that the collector interval, if set, is positive.
+func (s *Settings) validateCollectorInterval() error {
+	return validatePositiveSeconds("collector_interval", s.CollectorInterval)
 }
 
 // getDiskMaxIndex returns the maximum valid index for a given disk type.

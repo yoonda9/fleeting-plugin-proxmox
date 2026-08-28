@@ -26,8 +26,7 @@ var (
 
 const (
 	triggerChannelCapacity = 100
-	networkCheckTimeout    = 5 * time.Second
-	networkCheckRetries    = 12
+	networkCheckInterval   = 5 * time.Second
 )
 
 type InstanceGroup struct {
@@ -388,7 +387,10 @@ func (ig *InstanceGroup) Suspend(ctx context.Context, instances []string) ([]str
 }
 
 func (ig *InstanceGroup) getConnectInfoFromVM(ctx context.Context, instance string, vm *proxmox.VirtualMachine) (provider.ConnectInfo, error) {
-	for retry := range networkCheckRetries {
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(*ig.InstanceConnectTimeout)*time.Second)
+	defer cancel()
+
+	for retry := 0; ; retry++ {
 		networkInterfaces, err := vm.AgentGetNetworkIFaces(ctx)
 		if err != nil {
 			return provider.ConnectInfo{}, fmt.Errorf("failed to retrieve instance vmid='%d' interfaces: %w", vm.VMID, err)
@@ -397,7 +399,12 @@ func (ig *InstanceGroup) getConnectInfoFromVM(ctx context.Context, instance stri
 		internalAddress, externalAddress, err := determineAddresses(networkInterfaces, ig.InstanceNetworkInterface, ig.InstanceNetworkProtocol)
 		if err != nil {
 			ig.log.Error("failed to get network interface", "retry", retry, "vmid", vm.VMID, "err", err)
-			time.Sleep(networkCheckTimeout)
+
+			select {
+			case <-ctx.Done():
+				return provider.ConnectInfo{}, fmt.Errorf("%w vmid='%d'", ErrInstanceConnectionTimeout, vm.VMID)
+			case <-time.After(networkCheckInterval):
+			}
 
 			continue
 		}
@@ -409,6 +416,4 @@ func (ig *InstanceGroup) getConnectInfoFromVM(ctx context.Context, instance stri
 			ConnectorConfig: ig.FleetingSettings.ConnectorConfig,
 		}, nil
 	}
-
-	return provider.ConnectInfo{}, fmt.Errorf("%w vmid='%d'", ErrInstanceConnectionTimeout, vm.VMID)
 }
