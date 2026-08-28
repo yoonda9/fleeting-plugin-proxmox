@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
+	"time"
 )
 
 var (
@@ -35,7 +36,11 @@ const (
 	DefaultInstanceNameRunning  = "fleeting-running"
 	DefaultInstanceNameRemoving = "fleeting-removing"
 
-	DefaultProxmoxTaskWaitInterval int = 10
+	DefaultProxmoxTaskWaitInterval   int = 10
+	DefaultProxmoxTaskWaitTimeout    int = 300
+	DefaultInstanceAgentStartTimeout int = 120
+	DefaultInstanceConnectTimeout    int = 60
+	DefaultCollectorInterval         int = 60
 )
 
 // Disk index limits for each disk type.
@@ -101,6 +106,18 @@ type Settings struct {
 
 	// How often should task status be queried
 	ProxmoxTaskWaitInterval *int `json:"proxmox_task_wait_interval"`
+
+	// How long to wait for a Proxmox task (clone, resize, start, stop, delete) to complete.
+	ProxmoxTaskWaitTimeout *int `json:"proxmox_task_wait_timeout"`
+
+	// How long to wait for the QEMU guest agent to start on a newly deployed instance.
+	InstanceAgentStartTimeout *int `json:"instance_agent_start_timeout"`
+
+	// How long to wait for a newly deployed instance to report a usable network address.
+	InstanceConnectTimeout *int `json:"instance_connect_timeout"`
+
+	// How often the collector polls for instances to remove.
+	CollectorInterval *int `json:"collector_interval"`
 }
 
 func (s *Settings) FillWithDefaults() {
@@ -124,10 +141,27 @@ func (s *Settings) FillWithDefaults() {
 		s.InstanceNetworkProtocol = DefaultInstanceNetworkProtocol
 	}
 
-	if s.ProxmoxTaskWaitInterval == nil {
-		s.ProxmoxTaskWaitInterval = new(int)
-		*s.ProxmoxTaskWaitInterval = DefaultProxmoxTaskWaitInterval
+	defaultInt(&s.ProxmoxTaskWaitInterval, DefaultProxmoxTaskWaitInterval)
+
+	defaultInt(&s.ProxmoxTaskWaitTimeout, DefaultProxmoxTaskWaitTimeout)
+
+	defaultInt(&s.InstanceAgentStartTimeout, DefaultInstanceAgentStartTimeout)
+
+	defaultInt(&s.InstanceConnectTimeout, DefaultInstanceConnectTimeout)
+
+	defaultInt(&s.CollectorInterval, DefaultCollectorInterval)
+}
+
+// defaultInt points an unset optional integer setting at its default.
+func defaultInt(setting **int, value int) {
+	if *setting == nil {
+		*setting = &value
 	}
+}
+
+// seconds converts a settings value denominated in seconds to a Duration.
+func seconds(setting *int) time.Duration {
+	return time.Duration(*setting) * time.Second
 }
 
 func (s *Settings) CheckRequiredFields() error {
@@ -145,6 +179,7 @@ func (s *Settings) CheckRequiredFields() error {
 		{"instance_autoresize_disk", s.validateInstanceAutoresizeDisk},
 		{"instance_autoresize_size", s.validateInstanceAutoresizeSize},
 		{"instance_autoresize_consistency", s.validateInstanceAutoresizeConsistency},
+		{"positive_settings", s.validatePositiveSettings},
 	}
 
 	for _, v := range validators {
@@ -238,6 +273,32 @@ func (s *Settings) validateInstanceAutoresizeDisk() error {
 
 	if i > maxIndex {
 		return fmt.Errorf("%w: instance_autoresize_disk: disk type is valid, but index %s is not possible", ErrSettingInvalidParameter, matches[2])
+	}
+
+	return nil
+}
+
+// settingUnit is the unit an error message quotes for a positive integer setting.
+type settingUnit string
+
+const unitSeconds settingUnit = "seconds"
+
+// validatePositiveSettings checks every optional integer setting that must be positive when
+// set. Each entry names the setting as the operator spells it and the unit the error quotes.
+func (s *Settings) validatePositiveSettings() error {
+	for _, setting := range []struct {
+		name  string
+		unit  settingUnit
+		value *int
+	}{
+		{"proxmox_task_wait_timeout", unitSeconds, s.ProxmoxTaskWaitTimeout},
+		{"instance_agent_start_timeout", unitSeconds, s.InstanceAgentStartTimeout},
+		{"instance_connect_timeout", unitSeconds, s.InstanceConnectTimeout},
+		{"collector_interval", unitSeconds, s.CollectorInterval},
+	} {
+		if setting.value != nil && *setting.value <= 0 {
+			return fmt.Errorf("%w: %s: must be a positive number of %s", ErrSettingInvalidParameter, setting.name, setting.unit)
+		}
 	}
 
 	return nil

@@ -5,15 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/luthermonson/go-proxmox"
 )
 
 const (
-	proxmoxTaskWaitTimeout   = 5 * time.Minute
-	proxmoxAgentStartTimeout = 2 * time.Minute
-
 	vmOptName = "name"
 	vmOptTags = "tags"
 
@@ -27,7 +23,7 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 	if err == nil {
 		ig.log.Info("Deploying new instance", "vmid", VMID)
 
-		err = ig.waitTask(ctx, task, proxmoxTaskWaitTimeout)
+		err = ig.waitTask(ctx, task)
 	}
 
 	if err != nil {
@@ -52,7 +48,7 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 		if ig.InstanceAutoresizeSize != "" {
 			task, err := vm.ResizeDisk(ctx, ig.InstanceAutoresizeDisk, ig.InstanceAutoresizeSize)
 			if err == nil {
-				err = ig.waitTask(ctx, task, proxmoxTaskWaitTimeout)
+				err = ig.waitTask(ctx, task)
 			}
 
 			if err != nil {
@@ -63,7 +59,7 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 		// Start the VM
 		task, err := vm.Start(ctx)
 		if err == nil {
-			err = ig.waitTask(ctx, task, proxmoxTaskWaitTimeout)
+			err = ig.waitTask(ctx, task)
 		}
 
 		if err != nil {
@@ -71,7 +67,7 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 		}
 
 		// Wait for agent to start
-		err = vm.WaitForAgent(ctx, int(proxmoxAgentStartTimeout/time.Second))
+		err = vm.WaitForAgent(ctx, *ig.InstanceAgentStartTimeout)
 		if err != nil {
 			return fmt.Errorf("failed when waiting for qemu agent to start on newly deployed instance: %w", err)
 		}
@@ -211,7 +207,7 @@ func (ig *InstanceGroup) markInstanceForRemoval(ctx context.Context, instance *p
 		}
 
 		if err == nil {
-			err = ig.waitTask(ctx, task, proxmoxTaskWaitTimeout)
+			err = ig.waitTask(ctx, task)
 		}
 	}
 

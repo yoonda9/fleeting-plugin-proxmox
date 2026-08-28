@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"maps"
 	"slices"
-	"time"
 
 	"github.com/luthermonson/go-proxmox"
 )
@@ -53,7 +52,7 @@ func classifyTask(status, exitStatus string) error {
 }
 
 // waitTask waits for a Proxmox task to finish and turns a non-OK exit status into an error.
-func (ig *InstanceGroup) waitTask(ctx context.Context, task *proxmox.Task, timeout time.Duration) error {
+func (ig *InstanceGroup) waitTask(ctx context.Context, task *proxmox.Task) error {
 	// go-proxmox's NewTask returns nil for an empty UPID, so an operation Proxmox answers with
 	// null data yields no task. That may be a synchronous completion, so it is not an error
 	// here -- but it is never silent, and a caller for which "no task" means "not verified"
@@ -64,9 +63,7 @@ func (ig *InstanceGroup) waitTask(ctx context.Context, task *proxmox.Task, timeo
 		return nil
 	}
 
-	interval := time.Duration(*ig.ProxmoxTaskWaitInterval) * time.Second
-
-	err := task.Wait(ctx, interval, timeout)
+	err := task.Wait(ctx, seconds(ig.ProxmoxTaskWaitInterval), seconds(ig.ProxmoxTaskWaitTimeout))
 	if err != nil {
 		return fmt.Errorf("failed while waiting for task '%s': %w", task.UPID, err)
 	}

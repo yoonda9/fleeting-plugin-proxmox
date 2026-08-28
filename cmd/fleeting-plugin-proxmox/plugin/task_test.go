@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/luthermonson/go-proxmox"
@@ -49,14 +48,18 @@ func taskHandler(t *testing.T, taskType, status, exitStatus, logLine string) htt
 	}
 }
 
-// newWaitTestGroup is the minimum InstanceGroup waitTask needs: a poll interval and a logger.
+// newWaitTestGroup is an InstanceGroup with every setting at its default except the ones a
+// wait reads, which are one second: every fake here answers immediately, so a wait that is
+// still going after a second is a bug, not a slow server.
 func newWaitTestGroup() *InstanceGroup {
-	waitInterval := 1
+	ig := &InstanceGroup{log: hclog.NewNullLogger()}
+	ig.FillWithDefaults()
 
-	return &InstanceGroup{
-		Settings: Settings{ProxmoxTaskWaitInterval: &waitInterval},
-		log:      hclog.NewNullLogger(),
-	}
+	*ig.ProxmoxTaskWaitInterval = 1
+	*ig.ProxmoxTaskWaitTimeout = 1
+	*ig.InstanceAgentStartTimeout = 1
+
+	return ig
 }
 
 func TestClassifyTask(t *testing.T) {
@@ -131,7 +134,7 @@ func TestInstanceGroup_waitTask(t *testing.T) {
 
 	task := proxmox.NewTask(testTaskUPID, proxmox.NewClient(server.URL))
 
-	err := newWaitTestGroup().waitTask(context.Background(), task, time.Second)
+	err := newWaitTestGroup().waitTask(context.Background(), task)
 
 	require.ErrorIs(t, err, ErrTaskFailed)
 	require.Contains(t, err.Error(), "unable to parse volume ID 'local-lvm:'")
@@ -146,6 +149,6 @@ func TestInstanceGroup_waitTaskNilTask(t *testing.T) {
 	group := newWaitTestGroup()
 	group.log = log
 
-	require.NoError(t, group.waitTask(context.Background(), nil, time.Second))
+	require.NoError(t, group.waitTask(context.Background(), nil))
 	require.Regexp(t, `\[WARN\].*Proxmox returned no task to wait on`, logBuffer.String())
 }
