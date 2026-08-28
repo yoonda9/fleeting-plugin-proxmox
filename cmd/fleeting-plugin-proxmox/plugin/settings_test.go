@@ -36,6 +36,8 @@ func TestSettings_fillWithDefaults(t *testing.T) {
 	require.Equal(t, 120, *settings.InstanceAgentStartTimeout)
 	require.Equal(t, 60, *settings.InstanceConnectTimeout)
 	require.Equal(t, 60, *settings.CollectorInterval)
+	require.Equal(t, 60, *settings.HTTPTimeout)
+	require.Equal(t, 8, *settings.HTTPMaxIdleConnsPerHost)
 
 	settings2 := Settings{
 		InstanceNameCreating: sampleInstanceNameCreating,
@@ -54,12 +56,16 @@ func TestSettings_fillWithDefaults_timeoutsHonoured(t *testing.T) {
 	agentStartTimeout := 222
 	connectTimeout := 333
 	collectorInterval := 444
+	httpTimeout := 555
+	httpMaxIdleConnsPerHost := 16
 
 	settings := Settings{
 		ProxmoxTaskWaitTimeout:    &taskWaitTimeout,
 		InstanceAgentStartTimeout: &agentStartTimeout,
 		InstanceConnectTimeout:    &connectTimeout,
 		CollectorInterval:         &collectorInterval,
+		HTTPTimeout:               &httpTimeout,
+		HTTPMaxIdleConnsPerHost:   &httpMaxIdleConnsPerHost,
 	}
 	settings.FillWithDefaults()
 
@@ -67,6 +73,8 @@ func TestSettings_fillWithDefaults_timeoutsHonoured(t *testing.T) {
 	require.Equal(t, agentStartTimeout, *settings.InstanceAgentStartTimeout)
 	require.Equal(t, connectTimeout, *settings.InstanceConnectTimeout)
 	require.Equal(t, collectorInterval, *settings.CollectorInterval)
+	require.Equal(t, httpTimeout, *settings.HTTPTimeout)
+	require.Equal(t, httpMaxIdleConnsPerHost, *settings.HTTPMaxIdleConnsPerHost)
 }
 
 func TestSettings_validateTimeoutSettings(t *testing.T) {
@@ -110,6 +118,11 @@ func TestSettings_validateTimeoutSettings(t *testing.T) {
 			func(s *Settings, v *int) { s.CollectorInterval = v },
 			(*Settings).validateCollectorInterval,
 		},
+		{
+			"http_timeout",
+			func(s *Settings, v *int) { s.HTTPTimeout = v },
+			(*Settings).validateHTTPTimeout,
+		},
 	}
 
 	for _, field := range fields {
@@ -122,6 +135,32 @@ func TestSettings_validateTimeoutSettings(t *testing.T) {
 				require.ErrorIs(t, err, tt.expectedError)
 			})
 		}
+	}
+}
+
+func TestSettings_validateHTTPMaxIdleConnsPerHost(t *testing.T) {
+	negative := -1
+	zero := 0
+	positive := 16
+
+	tests := []struct {
+		name          string
+		value         *int
+		expectedError error
+	}{
+		{"unset is valid", nil, nil},
+		{"positive is valid", &positive, nil},
+		{"zero is invalid", &zero, ErrSettingInvalidParameter},
+		{"negative is invalid", &negative, ErrSettingInvalidParameter},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings := &Settings{HTTPMaxIdleConnsPerHost: tt.value}
+
+			err := settings.validateHTTPMaxIdleConnsPerHost()
+			require.ErrorIs(t, err, tt.expectedError)
+		})
 	}
 }
 
@@ -234,6 +273,32 @@ func TestSettings_checkRequiredFields(t *testing.T) {
 				TemplateID:          &sampleTemplateID,
 				MaxInstances:        &sampleMaxInstances,
 				CollectorInterval:   &sampleInvalidTimeout,
+			},
+			expectedError: ErrSettingInvalidParameter,
+		},
+		{
+			name: "Invalid http timeout",
+			settings: Settings{
+				URL:                 sampleURL,
+				CredentialsFilePath: sampleCredentialsPath,
+				Pool:                samplePool,
+				Storage:             sampleStorage,
+				TemplateID:          &sampleTemplateID,
+				MaxInstances:        &sampleMaxInstances,
+				HTTPTimeout:         &sampleInvalidTimeout,
+			},
+			expectedError: ErrSettingInvalidParameter,
+		},
+		{
+			name: "Invalid http max idle conns per host",
+			settings: Settings{
+				URL:                     sampleURL,
+				CredentialsFilePath:     sampleCredentialsPath,
+				Pool:                    samplePool,
+				Storage:                 sampleStorage,
+				TemplateID:              &sampleTemplateID,
+				MaxInstances:            &sampleMaxInstances,
+				HTTPMaxIdleConnsPerHost: &sampleInvalidTimeout,
 			},
 			expectedError: ErrSettingInvalidParameter,
 		},

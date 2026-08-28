@@ -40,6 +40,8 @@ const (
 	DefaultInstanceAgentStartTimeout int = 120
 	DefaultInstanceConnectTimeout    int = 60
 	DefaultCollectorInterval         int = 60
+	DefaultHTTPTimeout               int = 60
+	DefaultHTTPMaxIdleConnsPerHost   int = 8
 )
 
 // Disk index limits for each disk type.
@@ -117,6 +119,12 @@ type Settings struct {
 
 	// How often the collector polls for instances to remove.
 	CollectorInterval *int `json:"collector_interval"`
+
+	// Per-request deadline for calls to the Proxmox VE API.
+	HTTPTimeout *int `json:"http_timeout"`
+
+	// Maximum idle HTTP connections to keep open per Proxmox VE host.
+	HTTPMaxIdleConnsPerHost *int `json:"http_max_idle_conns_per_host"`
 }
 
 func (s *Settings) FillWithDefaults() {
@@ -164,6 +172,16 @@ func (s *Settings) FillWithDefaults() {
 		s.CollectorInterval = new(int)
 		*s.CollectorInterval = DefaultCollectorInterval
 	}
+
+	if s.HTTPTimeout == nil {
+		s.HTTPTimeout = new(int)
+		*s.HTTPTimeout = DefaultHTTPTimeout
+	}
+
+	if s.HTTPMaxIdleConnsPerHost == nil {
+		s.HTTPMaxIdleConnsPerHost = new(int)
+		*s.HTTPMaxIdleConnsPerHost = DefaultHTTPMaxIdleConnsPerHost
+	}
 }
 
 func (s *Settings) CheckRequiredFields() error {
@@ -185,6 +203,8 @@ func (s *Settings) CheckRequiredFields() error {
 		{"instance_agent_start_timeout", s.validateInstanceAgentStartTimeout},
 		{"instance_connect_timeout", s.validateInstanceConnectTimeout},
 		{"collector_interval", s.validateCollectorInterval},
+		{"http_timeout", s.validateHTTPTimeout},
+		{"http_max_idle_conns_per_host", s.validateHTTPMaxIdleConnsPerHost},
 	}
 
 	for _, v := range validators {
@@ -310,6 +330,25 @@ func (s *Settings) validateInstanceConnectTimeout() error {
 // validateCollectorInterval checks that the collector interval, if set, is positive.
 func (s *Settings) validateCollectorInterval() error {
 	return validatePositiveSeconds("collector_interval", s.CollectorInterval)
+}
+
+// validateHTTPTimeout checks that the HTTP timeout, if set, is positive.
+func (s *Settings) validateHTTPTimeout() error {
+	return validatePositiveSeconds("http_timeout", s.HTTPTimeout)
+}
+
+// validatePositiveInt checks that an optional setting, if set, is positive.
+func validatePositiveInt(name string, value *int) error {
+	if value != nil && *value <= 0 {
+		return fmt.Errorf("%w: %s: must be a positive number", ErrSettingInvalidParameter, name)
+	}
+
+	return nil
+}
+
+// validateHTTPMaxIdleConnsPerHost checks that the max idle conns per host, if set, is positive.
+func (s *Settings) validateHTTPMaxIdleConnsPerHost() error {
+	return validatePositiveInt("http_max_idle_conns_per_host", s.HTTPMaxIdleConnsPerHost)
 }
 
 // getDiskMaxIndex returns the maximum valid index for a given disk type.
