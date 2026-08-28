@@ -57,6 +57,9 @@ type InstanceGroup struct {
 
 	// Wait group for session ticket refresher.
 	sessionTicketRefresherWaitGroup sync.WaitGroup `json:"-"`
+
+	// Guards the shutdown triggers so Shutdown can be called more than once.
+	shutdownOnce sync.Once `json:"-"`
 }
 
 // Init implements provider.InstanceGroup.
@@ -106,9 +109,10 @@ func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings
 
 // Shutdown implements provider.InstanceGroup.
 func (ig *InstanceGroup) Shutdown(_ context.Context) error {
-	ig.collectorShutdownTrigger <- struct{}{}
-
-	ig.sessionTicketRefresherShutdownTrigger <- struct{}{}
+	ig.shutdownOnce.Do(func() {
+		close(ig.collectorShutdownTrigger)
+		close(ig.sessionTicketRefresherShutdownTrigger)
+	})
 
 	ig.collectorWaitGroup.Wait()
 	ig.sessionTicketRefresherWaitGroup.Wait()

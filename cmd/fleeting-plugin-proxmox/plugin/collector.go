@@ -109,6 +109,16 @@ func (ig *InstanceGroup) collectInstance(ctx context.Context, member proxmox.Clu
 	}
 }
 
+// triggerCollection wakes up the collector without blocking. The channel is a
+// wake-up signal, not a queue, so a full channel means a collection run is
+// already pending and the send is simply dropped.
+func (ig *InstanceGroup) triggerCollection() {
+	select {
+	case ig.instanceCollectionTrigger <- struct{}{}:
+	default:
+	}
+}
+
 func (ig *InstanceGroup) drainInstanceCollectionTriggerChannel() {
 	for {
 		select {

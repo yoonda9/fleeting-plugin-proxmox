@@ -215,11 +215,11 @@ func (ig *InstanceGroup) markInstancesForRemoval(ctx context.Context, instances 
 
 	err := errorGroup.Wait()
 	if err != nil {
-		ig.instanceCollectionTrigger <- struct{}{}
+		ig.triggerCollection()
 		return fmt.Errorf("failed to mark one or more instances for removal: %w", err)
 	}
 
-	ig.instanceCollectionTrigger <- struct{}{}
+	ig.triggerCollection()
 
 	return nil
 }
