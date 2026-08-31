@@ -31,23 +31,49 @@ func classifyTask(status, exitStatus string) error {
 	return fmt.Errorf("%w: %s", ErrTaskFailed, exitStatus)
 }
 
-// timeout is a parameter, not a constant, because instances.go and collector.go pass different
-// timeouts (proxmoxTaskWaitTimeout vs collectionTimeout) even though both happen to be 5 minutes today.
+// taskWaitTimeout returns the configured Proxmox task wait timeout as a Duration.
+func (ig *InstanceGroup) taskWaitTimeout() time.Duration {
+	return time.Duration(*ig.ProxmoxTaskWaitTimeout) * time.Second
+}
+
+// waitTask polls task itself rather than delegating to Task.Wait, which returns on
+// the very first Ping error (vendor tasks.go:160-162). Task waits are where the
+// plugin spends nearly all of its time, so that is where a loaded node is most
+// likely to blip: a single 502 from an overloaded pveproxy would otherwise fail a
+// five-minute clone that is progressing perfectly well. classTransient Ping errors
+// are treated as "keep waiting"; anything else fails the wait immediately.
 func (ig *InstanceGroup) waitTask(ctx context.Context, task *proxmox.Task, timeout time.Duration) error {
 	interval := time.Duration(*ig.ProxmoxTaskWaitInterval) * time.Second
 
-	err := task.Wait(ctx, interval, timeout)
-	if err != nil {
-		return fmt.Errorf("failed while waiting for task '%s': %w", task.UPID, err)
-	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
-	err = classifyTask(task.Status, task.ExitStatus)
-	if err != nil {
-		ig.logTaskFailure(ctx, task)
-		return err
-	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
-	return nil
+	for {
+		pingErr := task.Ping(ctx)
+
+		switch {
+		case pingErr == nil && task.Status != proxmox.TaskRunning:
+			err := classifyTask(task.Status, task.ExitStatus)
+			if err != nil {
+				ig.logTaskFailure(ctx, task)
+			}
+
+			return err
+		case pingErr != nil && ctx.Err() == nil && classifyError(pingErr) == classTransient:
+			ig.log.Warn("transient error polling proxmox task, will keep waiting", "upid", task.UPID, "err", pingErr)
+		case pingErr != nil:
+			return fmt.Errorf("failed while waiting for task '%s': %w", task.UPID, pingErr)
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("failed while waiting for task '%s': %w", task.UPID, ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 // logTaskFailure is best effort: a failure to fetch the log must never replace the task error.

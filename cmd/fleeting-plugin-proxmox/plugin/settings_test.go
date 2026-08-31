@@ -10,14 +10,16 @@ import (
 var (
 	sampleURL = "https://example.com"
 	//nolint:gosec
-	sampleCredentialsPath      = "/tmp/proxmox_credentials.json"
-	samplePool                 = "sample_pool"
-	sampleStorage              = "sample_storage"
-	sampleTemplateID           = 20
-	sampleMaxInstances         = 7
-	sampleInstanceNameCreating = "proxmox-creating"
-	sampleInstanceNameRunning  = "running-prox"
-	sampleInstanceNameRemoving = "proxve-removing"
+	sampleCredentialsPath        = "/tmp/proxmox_credentials.json"
+	samplePool                   = "sample_pool"
+	sampleStorage                = "sample_storage"
+	sampleTemplateID             = 20
+	sampleMaxInstances           = 7
+	sampleInstanceNameCreating   = "proxmox-creating"
+	sampleInstanceNameRunning    = "running-prox"
+	sampleInstanceNameRemoving   = "proxve-removing"
+	sampleInvalidTimeout         = 0
+	sampleNegativeBandwidthLimit = -1
 )
 
 func TestSettings_fillWithDefaults(t *testing.T) {
@@ -31,6 +33,14 @@ func TestSettings_fillWithDefaults(t *testing.T) {
 	require.Equal(t, "fleeting-removing", settings.InstanceNameRemoving)
 	require.Equal(t, "ipv4", settings.InstanceNetworkProtocol)
 	require.Equal(t, 10, *settings.ProxmoxTaskWaitInterval)
+	require.Equal(t, 300, *settings.ProxmoxTaskWaitTimeout)
+	require.Equal(t, 120, *settings.InstanceAgentStartTimeout)
+	require.Equal(t, 60, *settings.InstanceConnectTimeout)
+	require.Equal(t, 60, *settings.CollectorInterval)
+	require.Equal(t, 60, *settings.HTTPTimeout)
+	require.Equal(t, 8, *settings.HTTPMaxIdleConnsPerHost)
+	require.Equal(t, 3, *settings.ProxmoxAPIRetryAttempts)
+	require.Equal(t, 4, *settings.CloneConcurrency)
 
 	settings2 := Settings{
 		InstanceNameCreating: sampleInstanceNameCreating,
@@ -42,6 +52,288 @@ func TestSettings_fillWithDefaults(t *testing.T) {
 	require.Equal(t, sampleInstanceNameCreating, settings2.InstanceNameCreating)
 	require.Equal(t, sampleInstanceNameRunning, settings2.InstanceNameRunning)
 	require.Equal(t, sampleInstanceNameRemoving, settings2.InstanceNameRemoving)
+}
+
+func TestSettings_fillWithDefaults_timeoutsHonoured(t *testing.T) {
+	taskWaitTimeout := 111
+	agentStartTimeout := 222
+	connectTimeout := 333
+	collectorInterval := 444
+	httpTimeout := 555
+	httpMaxIdleConnsPerHost := 16
+	proxmoxAPIRetryAttempts := 5
+	cloneConcurrency := 2
+
+	settings := Settings{
+		ProxmoxTaskWaitTimeout:    &taskWaitTimeout,
+		InstanceAgentStartTimeout: &agentStartTimeout,
+		InstanceConnectTimeout:    &connectTimeout,
+		CollectorInterval:         &collectorInterval,
+		HTTPTimeout:               &httpTimeout,
+		HTTPMaxIdleConnsPerHost:   &httpMaxIdleConnsPerHost,
+		ProxmoxAPIRetryAttempts:   &proxmoxAPIRetryAttempts,
+		CloneConcurrency:          &cloneConcurrency,
+	}
+	settings.FillWithDefaults()
+
+	require.Equal(t, taskWaitTimeout, *settings.ProxmoxTaskWaitTimeout)
+	require.Equal(t, agentStartTimeout, *settings.InstanceAgentStartTimeout)
+	require.Equal(t, connectTimeout, *settings.InstanceConnectTimeout)
+	require.Equal(t, collectorInterval, *settings.CollectorInterval)
+	require.Equal(t, httpTimeout, *settings.HTTPTimeout)
+	require.Equal(t, httpMaxIdleConnsPerHost, *settings.HTTPMaxIdleConnsPerHost)
+	require.Equal(t, proxmoxAPIRetryAttempts, *settings.ProxmoxAPIRetryAttempts)
+	require.Equal(t, cloneConcurrency, *settings.CloneConcurrency)
+}
+
+// TestSettings_fillWithDefaults_httpMaxIdleConnsPerHostDerivedFromCloneConcurrency
+// is the regression test for a backward-compatibility break:
+// a fixed DefaultHTTPMaxIdleConnsPerHost meant raising clone_concurrency well
+// above 4 left too few idle connections for the in-flight clones, forcing the
+// transport to reopen them mid-burst. The default must derive from
+// clone_concurrency so an unset idle-conns setting always covers it.
+func TestSettings_fillWithDefaults_httpMaxIdleConnsPerHostDerivedFromCloneConcurrency(t *testing.T) {
+	tests := []struct {
+		name             string
+		cloneConcurrency int
+		expectedConns    int
+	}{
+		{"default clone concurrency derives the documented default", 4, 8},
+		{"clone concurrency above the flat default derives above it", 10, 14},
+		{"low clone concurrency still clamps to the flat floor", 1, 8},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cloneConcurrency := tt.cloneConcurrency
+			settings := Settings{CloneConcurrency: &cloneConcurrency}
+			settings.FillWithDefaults()
+
+			require.Equal(t, tt.expectedConns, *settings.HTTPMaxIdleConnsPerHost)
+		})
+	}
+}
+
+func TestDefaultHTTPMaxIdleConnsPerHost(t *testing.T) {
+	tests := []struct {
+		name             string
+		cloneConcurrency int
+		expected         int
+	}{
+		{"clamps to the flat floor", 1, 8},
+		{"just above the floor is unclamped", 5, 9},
+		{"default clone concurrency derives to the floor", 4, 8},
+		{"high clone concurrency is unclamped", 20, 24},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.expected, defaultHTTPMaxIdleConnsPerHost(tt.cloneConcurrency))
+		})
+	}
+}
+
+func TestSettings_validateTimeoutSettings(t *testing.T) {
+	negative := -1
+	zero := 0
+	positive := 30
+
+	tests := []struct {
+		name          string
+		value         *int
+		expectedError error
+	}{
+		{"unset is valid", nil, nil},
+		{"positive is valid", &positive, nil},
+		{"zero is invalid", &zero, ErrSettingInvalidParameter},
+		{"negative is invalid", &negative, ErrSettingInvalidParameter},
+	}
+
+	fields := []struct {
+		name     string
+		setValue func(*Settings, *int)
+		validate func(*Settings) error
+	}{
+		{
+			"proxmox_task_wait_timeout",
+			func(s *Settings, v *int) { s.ProxmoxTaskWaitTimeout = v },
+			(*Settings).validateProxmoxTaskWaitTimeout,
+		},
+		{
+			"instance_agent_start_timeout",
+			func(s *Settings, v *int) { s.InstanceAgentStartTimeout = v },
+			(*Settings).validateInstanceAgentStartTimeout,
+		},
+		{
+			"instance_connect_timeout",
+			func(s *Settings, v *int) { s.InstanceConnectTimeout = v },
+			(*Settings).validateInstanceConnectTimeout,
+		},
+		{
+			"collector_interval",
+			func(s *Settings, v *int) { s.CollectorInterval = v },
+			(*Settings).validateCollectorInterval,
+		},
+		{
+			"http_timeout",
+			func(s *Settings, v *int) { s.HTTPTimeout = v },
+			(*Settings).validateHTTPTimeout,
+		},
+	}
+
+	for _, field := range fields {
+		for _, tt := range tests {
+			t.Run(field.name+"/"+tt.name, func(t *testing.T) {
+				settings := &Settings{}
+				field.setValue(settings, tt.value)
+
+				err := field.validate(settings)
+				require.ErrorIs(t, err, tt.expectedError)
+			})
+		}
+	}
+}
+
+func TestSettings_validateHTTPMaxIdleConnsPerHost(t *testing.T) {
+	negative := -1
+	zero := 0
+	positive := 16
+
+	tests := []struct {
+		name          string
+		value         *int
+		expectedError error
+	}{
+		{"unset is valid", nil, nil},
+		{"positive is valid", &positive, nil},
+		{"zero is invalid", &zero, ErrSettingInvalidParameter},
+		{"negative is invalid", &negative, ErrSettingInvalidParameter},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings := &Settings{HTTPMaxIdleConnsPerHost: tt.value}
+
+			err := settings.validateHTTPMaxIdleConnsPerHost()
+			require.ErrorIs(t, err, tt.expectedError)
+		})
+	}
+}
+
+func TestSettings_validateProxmoxAPIRetryAttempts(t *testing.T) {
+	negative := -1
+	zero := 0
+	positive := 5
+
+	tests := []struct {
+		name          string
+		value         *int
+		expectedError error
+	}{
+		{"unset is valid", nil, nil},
+		{"positive is valid", &positive, nil},
+		{"zero is invalid", &zero, ErrSettingInvalidParameter},
+		{"negative is invalid", &negative, ErrSettingInvalidParameter},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings := &Settings{ProxmoxAPIRetryAttempts: tt.value}
+
+			err := settings.validateProxmoxAPIRetryAttempts()
+			require.ErrorIs(t, err, tt.expectedError)
+		})
+	}
+}
+
+func TestSettings_validateCloneConcurrency(t *testing.T) {
+	negative := -1
+	zero := 0
+	positive := 2
+
+	tests := []struct {
+		name          string
+		value         *int
+		expectedError error
+	}{
+		{"unset is valid", nil, nil},
+		{"positive is valid", &positive, nil},
+		{"zero is invalid", &zero, ErrSettingInvalidParameter},
+		{"negative is invalid", &negative, ErrSettingInvalidParameter},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings := &Settings{CloneConcurrency: tt.value}
+
+			err := settings.validateCloneConcurrency()
+			require.ErrorIs(t, err, tt.expectedError)
+		})
+	}
+}
+
+func TestSettings_validateCloneBandwidthLimit(t *testing.T) {
+	negative := -1
+	zero := 0
+	positive := 500
+
+	tests := []struct {
+		name          string
+		value         *int
+		expectedError error
+	}{
+		{"unset is valid", nil, nil},
+		{"positive is valid", &positive, nil},
+		{"zero is valid", &zero, nil},
+		{"negative is invalid", &negative, ErrSettingInvalidParameter},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings := &Settings{CloneBandwidthLimit: tt.value}
+
+			err := settings.validateCloneBandwidthLimit()
+			require.ErrorIs(t, err, tt.expectedError)
+		})
+	}
+}
+
+func TestSettings_validateVMIDRange(t *testing.T) {
+	var (
+		templateID = 20
+		start100   = 100
+		end200     = 200
+		end100     = 100 // equal to start100, an empty range
+		start20    = 20  // equal to templateID
+		end21      = 21
+	)
+
+	tests := []struct {
+		name          string
+		start, end    *int
+		expectedError error
+	}{
+		{"both unset is valid", nil, nil, nil},
+		{"both set, start < end, excludes template is valid", &start100, &end200, nil},
+		{"only start set is invalid", &start100, nil, ErrSettingInvalidParameter},
+		{"only end set is invalid", nil, &end200, ErrSettingInvalidParameter},
+		{"start == end is invalid", &start100, &end100, ErrSettingInvalidParameter},
+		{"start > end is invalid", &end200, &start100, ErrSettingInvalidParameter},
+		{"range containing template_id is invalid", &start20, &end21, ErrSettingInvalidParameter},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings := &Settings{
+				TemplateID:     &templateID,
+				VMIDRangeStart: tt.start,
+				VMIDRangeEnd:   tt.end,
+			}
+
+			err := settings.validateVMIDRange()
+			require.ErrorIs(t, err, tt.expectedError)
+		})
+	}
 }
 
 func TestSettings_checkRequiredFields(t *testing.T) {
@@ -140,6 +432,84 @@ func TestSettings_checkRequiredFields(t *testing.T) {
 				TemplateID:              &sampleTemplateID,
 				MaxInstances:            &sampleMaxInstances,
 				InstanceNetworkProtocol: "invalid-protocol",
+			},
+			expectedError: ErrSettingInvalidParameter,
+		},
+		{
+			name: "Invalid collector interval",
+			settings: Settings{
+				URL:                 sampleURL,
+				CredentialsFilePath: sampleCredentialsPath,
+				Pool:                samplePool,
+				Storage:             sampleStorage,
+				TemplateID:          &sampleTemplateID,
+				MaxInstances:        &sampleMaxInstances,
+				CollectorInterval:   &sampleInvalidTimeout,
+			},
+			expectedError: ErrSettingInvalidParameter,
+		},
+		{
+			name: "Invalid http timeout",
+			settings: Settings{
+				URL:                 sampleURL,
+				CredentialsFilePath: sampleCredentialsPath,
+				Pool:                samplePool,
+				Storage:             sampleStorage,
+				TemplateID:          &sampleTemplateID,
+				MaxInstances:        &sampleMaxInstances,
+				HTTPTimeout:         &sampleInvalidTimeout,
+			},
+			expectedError: ErrSettingInvalidParameter,
+		},
+		{
+			name: "Invalid http max idle conns per host",
+			settings: Settings{
+				URL:                     sampleURL,
+				CredentialsFilePath:     sampleCredentialsPath,
+				Pool:                    samplePool,
+				Storage:                 sampleStorage,
+				TemplateID:              &sampleTemplateID,
+				MaxInstances:            &sampleMaxInstances,
+				HTTPMaxIdleConnsPerHost: &sampleInvalidTimeout,
+			},
+			expectedError: ErrSettingInvalidParameter,
+		},
+		{
+			name: "Invalid proxmox api retry attempts",
+			settings: Settings{
+				URL:                     sampleURL,
+				CredentialsFilePath:     sampleCredentialsPath,
+				Pool:                    samplePool,
+				Storage:                 sampleStorage,
+				TemplateID:              &sampleTemplateID,
+				MaxInstances:            &sampleMaxInstances,
+				ProxmoxAPIRetryAttempts: &sampleInvalidTimeout,
+			},
+			expectedError: ErrSettingInvalidParameter,
+		},
+		{
+			name: "Invalid clone concurrency",
+			settings: Settings{
+				URL:                 sampleURL,
+				CredentialsFilePath: sampleCredentialsPath,
+				Pool:                samplePool,
+				Storage:             sampleStorage,
+				TemplateID:          &sampleTemplateID,
+				MaxInstances:        &sampleMaxInstances,
+				CloneConcurrency:    &sampleInvalidTimeout,
+			},
+			expectedError: ErrSettingInvalidParameter,
+		},
+		{
+			name: "Invalid clone bandwidth limit",
+			settings: Settings{
+				URL:                 sampleURL,
+				CredentialsFilePath: sampleCredentialsPath,
+				Pool:                samplePool,
+				Storage:             sampleStorage,
+				TemplateID:          &sampleTemplateID,
+				MaxInstances:        &sampleMaxInstances,
+				CloneBandwidthLimit: &sampleNegativeBandwidthLimit,
 			},
 			expectedError: ErrSettingInvalidParameter,
 		},

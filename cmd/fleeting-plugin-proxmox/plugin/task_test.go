@@ -111,3 +111,89 @@ func TestInstanceGroup_waitTask_failurePath(t *testing.T) {
 	require.Contains(t, err.Error(), exitStatus)
 	require.True(t, logFetched.Load(), "expected waitTask to fetch the task log on failure")
 }
+
+func TestInstanceGroup_waitTask_transientThenSuccess(t *testing.T) {
+	const upid = proxmox.UPID("UPID:pve-node:00001A2B:00000000:00000000:qmclone:100:root@pam:")
+
+	var requests atomic.Int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/status") {
+			t.Errorf("unexpected request path: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+
+			return
+		}
+
+		// The first two polls simulate an overloaded pveproxy: a 502 with a
+		// non-JSON (HTML) body, which surfaces to the plugin as a JSON decode
+		// error rather than a typed status - classifyError must still treat it
+		// as transient so the task wait keeps polling instead of failing.
+		if requests.Add(1) <= 2 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("<html>Bad Gateway</html>"))
+
+			return
+		}
+
+		fmt.Fprintf(w, `{"data":{"upid":%q,"node":"pve-node","type":"qmclone","id":"100","user":"root@pam","status":"stopped","exitstatus":"OK"}}`, upid)
+	}))
+	defer server.Close()
+
+	task := proxmox.NewTask(upid, proxmox.NewClient(server.URL))
+
+	waitInterval := 1
+	ig := InstanceGroup{
+		Settings: Settings{ProxmoxTaskWaitInterval: &waitInterval},
+		log:      hclog.NewNullLogger(),
+	}
+
+	err := ig.waitTask(context.Background(), task, 5*time.Second)
+
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, requests.Load(), int64(3))
+}
+
+func TestInstanceGroup_waitTask_transientOn500ThenSuccess(t *testing.T) {
+	const upid = proxmox.UPID("UPID:pve-node:00001A2B:00000000:00000000:qmclone:100:root@pam:")
+
+	var requests atomic.Int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/status") {
+			t.Errorf("unexpected request path: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+
+			return
+		}
+
+		// A bare 500 - go-proxmox's handleResponse returns errors.New(res.Status)
+		// for it without ever reading the body, so this is a genuine status-based
+		// classification, not a coincidence of an unparsable body like the
+		// HTML/502 case above. A valid JSON body proves that: if classifyError
+		// were instead relying on a decode failure, this case would fail to
+		// classify as transient and waitTask would give up here.
+		if requests.Add(1) <= 2 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"data":{"result":"ok"}}`))
+
+			return
+		}
+
+		fmt.Fprintf(w, `{"data":{"upid":%q,"node":"pve-node","type":"qmclone","id":"100","user":"root@pam","status":"stopped","exitstatus":"OK"}}`, upid)
+	}))
+	defer server.Close()
+
+	task := proxmox.NewTask(upid, proxmox.NewClient(server.URL))
+
+	waitInterval := 1
+	ig := InstanceGroup{
+		Settings: Settings{ProxmoxTaskWaitInterval: &waitInterval},
+		log:      hclog.NewNullLogger(),
+	}
+
+	err := ig.waitTask(context.Background(), task, 5*time.Second)
+
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, requests.Load(), int64(3))
+}

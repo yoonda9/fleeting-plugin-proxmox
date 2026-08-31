@@ -8,11 +8,7 @@ import (
 	"github.com/luthermonson/go-proxmox"
 )
 
-const (
-	collectionInterval         = 1 * time.Minute
-	collectionTimeout          = 5 * time.Minute
-	collectionWaitAfterTrigger = 10 * time.Second
-)
+const collectionWaitAfterTrigger = 10 * time.Second
 
 func (ig *InstanceGroup) startRemovedInstanceCollector() {
 	ig.collectorWaitGroup.Go(func() {
@@ -27,7 +23,7 @@ func (ig *InstanceGroup) runRemovedInstanceCollector() {
 		select {
 		case <-ig.collectorShutdownTrigger:
 			return
-		case <-time.After(collectionInterval):
+		case <-time.After(time.Duration(*ig.CollectorInterval) * time.Second):
 			ig.collectRemovedInstances()
 		case <-ig.instanceCollectionTrigger:
 			ig.drainInstanceCollectionTriggerChannel()
@@ -41,7 +37,7 @@ func (ig *InstanceGroup) runRemovedInstanceCollector() {
 }
 
 func (ig *InstanceGroup) collectRemovedInstances() {
-	ctx, cancel := context.WithTimeout(context.Background(), collectionTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), ig.taskWaitTimeout())
 	defer cancel()
 
 	ig.instanceCloningMu.Lock()
@@ -90,7 +86,7 @@ func (ig *InstanceGroup) collectInstance(ctx context.Context, member proxmox.Clu
 	if vm.Status == "running" {
 		task, err := vm.Stop(ctx)
 		if err == nil {
-			err = ig.waitTask(ctx, task, collectionTimeout)
+			err = ig.waitTask(ctx, task, ig.taskWaitTimeout())
 		}
 
 		if err != nil {
@@ -101,12 +97,15 @@ func (ig *InstanceGroup) collectInstance(ctx context.Context, member proxmox.Clu
 
 	task, err := vm.Delete(ctx, nil)
 	if err == nil {
-		err = ig.waitTask(ctx, task, collectionTimeout)
+		err = ig.waitTask(ctx, task, ig.taskWaitTimeout())
 	}
 
 	if err != nil {
 		ig.log.Error("collector failed to delete instance", "vmid", member.VMID, "err", err)
+		return
 	}
+
+	ig.vmids.Release(int(member.VMID))
 }
 
 // triggerCollection wakes up the collector without blocking. The channel is a
