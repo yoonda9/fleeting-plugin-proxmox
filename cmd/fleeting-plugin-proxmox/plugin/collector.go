@@ -30,8 +30,6 @@ func (ig *InstanceGroup) runRemovedInstanceCollector() {
 		case <-time.After(collectionInterval):
 			ig.collectRemovedInstances()
 		case <-ig.instanceCollectionTrigger:
-			ig.drainInstanceCollectionTriggerChannel()
-
 			// Sleep for a bit to give Proxmox a chance to propagate renames that happened before trigger
 			<-time.After(collectionWaitAfterTrigger)
 
@@ -109,13 +107,11 @@ func (ig *InstanceGroup) collectInstance(ctx context.Context, member proxmox.Clu
 	}
 }
 
-func (ig *InstanceGroup) drainInstanceCollectionTriggerChannel() {
-	for {
-		select {
-		case <-ig.instanceCollectionTrigger:
-			// NOOP
-		default:
-			return
-		}
+// triggerCollection wakes up the collector without blocking. The channel is a
+// wake-up signal, not a queue: a full channel already means a run is pending.
+func (ig *InstanceGroup) triggerCollection() {
+	select {
+	case ig.instanceCollectionTrigger <- struct{}{}:
+	default:
 	}
 }

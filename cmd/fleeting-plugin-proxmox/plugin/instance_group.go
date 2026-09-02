@@ -24,9 +24,8 @@ var (
 )
 
 const (
-	triggerChannelCapacity = 100
-	networkCheckTimeout    = 5 * time.Second
-	networkCheckRetries    = 12
+	networkCheckTimeout = 5 * time.Second
+	networkCheckRetries = 12
 )
 
 type InstanceGroup struct {
@@ -56,15 +55,16 @@ type InstanceGroup struct {
 
 	// Wait group for session ticket refresher.
 	sessionTicketRefresherWaitGroup sync.WaitGroup `json:"-"`
+
+	// Guards the channel closes; re-armed by resetLifecycle.
+	shutdownOnce sync.Once `json:"-"`
 }
 
 // Init implements provider.InstanceGroup.
 func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings provider.Settings) (provider.ProviderInfo, error) {
 	ig.log = logger
 	ig.FleetingSettings = settings
-	ig.instanceCollectionTrigger = make(chan struct{}, triggerChannelCapacity)
-	ig.collectorShutdownTrigger = make(chan struct{}, 1)
-	ig.sessionTicketRefresherShutdownTrigger = make(chan struct{}, 1)
+	ig.resetLifecycle()
 
 	err := ig.CheckRequiredFields()
 	if err != nil {
@@ -103,11 +103,25 @@ func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings
 	}, nil
 }
 
-// Shutdown implements provider.InstanceGroup.
+// Shutdown implements provider.InstanceGroup. It is safe to call repeatedly, and safe to call
+// before Init.
 func (ig *InstanceGroup) Shutdown(_ context.Context) error {
-	ig.collectorShutdownTrigger <- struct{}{}
+	// Before Init there is nothing to close and nothing to wait for, and closing a nil channel
+	// would panic and take the plugin process down. Both channels are only ever created
+	// together in resetLifecycle, so one check covers them. The check stays outside the guard as
+	// defence in depth rather than out of necessity: inside it, a pre-Init call would consume
+	// shutdownOnce without closing anything, and the Shutdown after the next Init would then be
+	// relying on resetLifecycle having re-armed it. resetLifecycle does re-arm it on every Init,
+	// so the placement is not what makes the second cycle work -- it just means Shutdown does not
+	// have to depend on that.
+	if ig.collectorShutdownTrigger == nil {
+		return nil
+	}
 
-	ig.sessionTicketRefresherShutdownTrigger <- struct{}{}
+	ig.shutdownOnce.Do(func() {
+		close(ig.collectorShutdownTrigger)
+		close(ig.sessionTicketRefresherShutdownTrigger)
+	})
 
 	ig.collectorWaitGroup.Wait()
 	ig.sessionTicketRefresherWaitGroup.Wait()
@@ -367,6 +381,17 @@ func (ig *InstanceGroup) Suspend(ctx context.Context, instances []string) ([]str
 	}
 
 	return succeeded, nil
+}
+
+// resetLifecycle creates the worker channels and re-arms the shutdown guard. The wait groups
+// Shutdown waits on need no reset -- a sync.WaitGroup is reusable once Wait has returned -- but
+// everything Shutdown closes is created here, so a group can be initialised again after a
+// Shutdown without the previous cycle's guard blocking the next one.
+func (ig *InstanceGroup) resetLifecycle() {
+	ig.instanceCollectionTrigger = make(chan struct{}, 1)
+	ig.collectorShutdownTrigger = make(chan struct{}, 1)
+	ig.sessionTicketRefresherShutdownTrigger = make(chan struct{}, 1)
+	ig.shutdownOnce = sync.Once{}
 }
 
 // batchError reports a batch of instance operations as failed only when nothing at all
