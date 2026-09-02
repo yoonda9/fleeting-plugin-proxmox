@@ -24,9 +24,8 @@ var (
 )
 
 const (
-	triggerChannelCapacity = 100
-	networkCheckTimeout    = 5 * time.Second
-	networkCheckRetries    = 12
+	networkCheckTimeout = 5 * time.Second
+	networkCheckRetries = 12
 )
 
 type InstanceGroup struct {
@@ -56,13 +55,16 @@ type InstanceGroup struct {
 
 	// Wait group for session ticket refresher.
 	sessionTicketRefresherWaitGroup sync.WaitGroup `json:"-"`
+
+	// Guards the shutdown triggers so Shutdown can be called more than once.
+	shutdownOnce sync.Once `json:"-"`
 }
 
 // Init implements provider.InstanceGroup.
 func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings provider.Settings) (provider.ProviderInfo, error) {
 	ig.log = logger
 	ig.FleetingSettings = settings
-	ig.instanceCollectionTrigger = make(chan struct{}, triggerChannelCapacity)
+	ig.instanceCollectionTrigger = make(chan struct{}, 1)
 	ig.collectorShutdownTrigger = make(chan struct{}, 1)
 	ig.sessionTicketRefresherShutdownTrigger = make(chan struct{}, 1)
 
@@ -104,10 +106,22 @@ func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings
 }
 
 // Shutdown implements provider.InstanceGroup.
+//
+// The InstanceGroup is single-use: the Once outlives any later Init, so a second
+// Init/Shutdown cycle on the same value would leak its workers. The plugin host runs one
+// Init and one Shutdown per process, which is the lifecycle this relies on.
 func (ig *InstanceGroup) Shutdown(_ context.Context) error {
-	ig.collectorShutdownTrigger <- struct{}{}
+	ig.shutdownOnce.Do(func() {
+		// The plugin host issues Shutdown even when Init never ran, and closing a nil channel
+		// panics, which would take the whole plugin process down. Both channels are only ever
+		// created together in Init, so one check covers them.
+		if ig.collectorShutdownTrigger == nil {
+			return
+		}
 
-	ig.sessionTicketRefresherShutdownTrigger <- struct{}{}
+		close(ig.collectorShutdownTrigger)
+		close(ig.sessionTicketRefresherShutdownTrigger)
+	})
 
 	ig.collectorWaitGroup.Wait()
 	ig.sessionTicketRefresherWaitGroup.Wait()
