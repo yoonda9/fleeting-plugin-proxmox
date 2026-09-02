@@ -13,7 +13,6 @@ import (
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/luthermonson/go-proxmox"
 	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
-	"golang.org/x/sync/errgroup"
 )
 
 var _ provider.InstanceGroup = (*InstanceGroup)(nil)
@@ -116,6 +115,37 @@ func (ig *InstanceGroup) Shutdown(_ context.Context) error {
 	return nil
 }
 
+// runParallel calls run once for every index in [0, count), returning how many calls failed
+// alongside each call's error in its own slot, so a failure stays matched to the item that
+// caused it without a lock.
+func runParallel(count int, run func(index int) error) (int, []error) {
+	if count <= 0 {
+		return 0, nil
+	}
+
+	var waitGroup sync.WaitGroup
+
+	errs := make([]error, count)
+
+	for index := range count {
+		waitGroup.Go(func() {
+			errs[index] = run(index)
+		})
+	}
+
+	waitGroup.Wait()
+
+	failed := 0
+
+	for _, err := range errs {
+		if err != nil {
+			failed++
+		}
+	}
+
+	return failed, errs
+}
+
 // Increase implements provider.InstanceGroup.
 func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 	template, err := ig.getProxmoxVM(ctx, *ig.TemplateID)
@@ -123,41 +153,28 @@ func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 		return 0, fmt.Errorf("failed to find template with id='%d': %w", *ig.TemplateID, err)
 	}
 
-	var (
-		errorGroup = new(errgroup.Group)
-
-		succeeded   = 0
-		succeededMu = new(sync.Mutex)
-
-		// We need to mutex cloning as Proxmox will fail multiple requests in parallel
-		cloneMu = new(sync.Mutex)
-	)
+	// We need to mutex cloning as Proxmox will fail multiple requests in parallel
+	cloneMu := new(sync.Mutex)
 
 	ig.instanceCloningMu.Lock()
 	defer ig.instanceCloningMu.Unlock()
 
-	for range count {
-		errorGroup.Go(func() error {
-			vmid, err := ig.deployInstance(ctx, template, cloneMu)
-			if err != nil {
-				ig.log.Error("failed to deploy an instance", "vmid", vmid, "err", err)
-			}
-
-			ig.log.Info("successfully deployed instance", "vmid", vmid)
-			succeededMu.Lock()
-			succeeded++
-			succeededMu.Unlock()
+	failed, errs := runParallel(count, func(_ int) error {
+		vmid, err := ig.deployInstance(ctx, template, cloneMu)
+		if err != nil {
+			ig.log.Error("failed to deploy an instance", "vmid", vmid, "err", err)
 
 			return err
-		})
-	}
+		}
 
-	err = errorGroup.Wait()
-	if err != nil {
-		return succeeded, fmt.Errorf("failed to create one or more instances: %w", err)
-	}
+		ig.log.Info("successfully deployed instance", "vmid", vmid)
 
-	return succeeded, nil
+		return nil
+	})
+
+	succeeded := count - failed
+
+	return succeeded, ig.batchError("failed to deploy some instances", succeeded, failed, errs)
 }
 
 // Update implements provider.InstanceGroup.
@@ -216,11 +233,11 @@ func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []strin
 		return []string{}, err
 	}
 
+	// Only members named in instancesToRemove can reach either slice, so that is the bound to
+	// size them by -- the pool holds the whole fleet and is typically far larger.
 	var (
-		errorGroup = new(errgroup.Group)
-
-		succeeded   = []string{}
-		succeededMu = new(sync.Mutex)
+		succeeded = make([]string, 0, len(instancesToRemove))
+		toRemove  = make([]*proxmox.ClusterResource, 0, len(instancesToRemove))
 	)
 
 	for _, member := range pool.Members {
@@ -228,7 +245,9 @@ func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []strin
 			continue
 		}
 
-		if !slices.Contains(instancesToRemove, strconv.FormatUint(member.VMID, 10)) {
+		vmid := strconv.FormatUint(member.VMID, 10)
+
+		if !slices.Contains(instancesToRemove, vmid) {
 			continue
 		}
 
@@ -239,33 +258,27 @@ func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []strin
 
 		if member.Name == ig.InstanceNameRemoving {
 			// Already deleting...
-			succeededMu.Lock()
-
-			succeeded = append(succeeded, strconv.FormatUint(member.VMID, 10))
-			succeededMu.Unlock()
+			succeeded = append(succeeded, vmid)
 
 			continue
 		}
 
 		ig.log.Info("removing instance", "vmid", member.VMID)
 
-		errorGroup.Go(func() error {
-			err := ig.markInstancesForRemoval(ctx, &member)
-			if err != nil {
-				return err
-			}
-
-			succeededMu.Lock()
-			defer succeededMu.Unlock()
-
-			succeeded = append(succeeded, strconv.FormatUint(member.VMID, 10))
-
-			return nil
-		})
+		toRemove = append(toRemove, &member)
 	}
 
-	//nolint:wrapcheck
-	return succeeded, errorGroup.Wait()
+	failed, errs := runParallel(len(toRemove), func(index int) error {
+		return ig.markInstancesForRemoval(ctx, toRemove[index])
+	})
+
+	for index, member := range toRemove {
+		if errs[index] == nil {
+			succeeded = append(succeeded, strconv.FormatUint(member.VMID, 10))
+		}
+	}
+
+	return succeeded, ig.batchError("failed to mark some instances for removal", len(succeeded), failed, errs)
 }
 
 func (ig *InstanceGroup) Heartbeat(ctx context.Context, instance string) error {
@@ -354,6 +367,32 @@ func (ig *InstanceGroup) Suspend(ctx context.Context, instances []string) ([]str
 	}
 
 	return succeeded, nil
+}
+
+// batchError reports a batch of instance operations as failed only when nothing at all
+// succeeded, and logs the aggregate trace that decision hides. It is the one place that rule
+// lives, for both Increase and Decrease.
+//
+// A partial success is reported with a NIL error. fleeting's gRPC shim returns the response
+// alongside the error and grpc-go discards the response whenever the error is non-nil, so a
+// partial success reported as an error reaches the provisioner as no instances at all --
+// leaving instances that were in fact created or removed untracked and classified
+// CauseUnexpected. Each individual failure is already logged where it happened, so the warning
+// here only has to record how much the nil error is hiding.
+//
+// succeeded is a parameter rather than counted from errs because Decrease also counts instances
+// that were already being removed, which errs knows nothing about. An empty errs means nothing
+// was attempted, which errors.Join already reports as success.
+func (ig *InstanceGroup) batchError(msg string, succeeded, failed int, errs []error) error {
+	if succeeded == 0 {
+		return errors.Join(errs...)
+	}
+
+	if failed > 0 {
+		ig.log.Warn(msg, "attempted", len(errs), "failed", failed)
+	}
+
+	return nil
 }
 
 func (ig *InstanceGroup) getConnectInfoFromVM(ctx context.Context, instance string, vm *proxmox.VirtualMachine) (provider.ConnectInfo, error) {
