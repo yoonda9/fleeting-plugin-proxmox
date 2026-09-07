@@ -87,8 +87,18 @@ type removalTestServer struct {
 	// configResponse is the body the rename POST answers with; empty means a task UPID.
 	configResponse string
 
+	// members is the pool the fake serves; empty means the one stale instance above.
+	members []removalTestMember
+
 	// requests tallies the requests the fake served; nil means do not report them.
 	requests *removalRequestCounts
+}
+
+// removalTestMember is one VM in the fake's pool. It appears in the pool listing and answers a
+// status and a config fetch under its own vmid, which is everything a rename needs.
+type removalTestMember struct {
+	vmid uint64
+	name string
 }
 
 // removalRequestCounts records how often the fake was asked for each of the two things a
@@ -125,63 +135,79 @@ func newRemovalTestGroup(t *testing.T, opts removalTestServer) *InstanceGroup {
 	}
 
 	renameUPID := testUPID("qmconfig")
+	renameTask := taskHandler(t, "qmconfig", taskStatusStopped, "VM is locked (clone)", "TASK ERROR: VM is locked (clone)")
 
 	configResponse := opts.configResponse
 	if configResponse == "" {
 		configResponse = fmt.Sprintf(`{"data":%q}`, renameUPID)
 	}
 
+	members := opts.members
+	if len(members) == 0 {
+		members = []removalTestMember{{vmid: 100, name: "fleeting-creating"}}
+	}
+
+	var (
+		poolMembers  = make([]string, 0, len(members))
+		memberStatus = make(map[string]string, len(members))
+		memberConfig = make(map[string]bool, len(members))
+	)
+
+	for _, member := range members {
+		poolMembers = append(poolMembers,
+			fmt.Sprintf(`{"vmid":%d,"type":"qemu","name":%q,"node":"pve-node"}`, member.vmid, member.name))
+		memberStatus[fmt.Sprintf("/nodes/pve-node/qemu/%d/status/current", member.vmid)] =
+			fmt.Sprintf(`{"data":{"vmid":%d,"name":%q,"status":"running"}}`, member.vmid, member.name)
+		memberConfig[fmt.Sprintf("/nodes/pve-node/qemu/%d/config", member.vmid)] = true
+	}
+
+	poolBody := fmt.Sprintf(`{"data":[{"poolid":"test-pool","members":[%s]}]}`, strings.Join(poolMembers, ","))
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/pools"):
-			fmt.Fprint(w, `{"data":[{"poolid":"test-pool","members":[{"vmid":100,"type":"qemu","name":"fleeting-creating","node":"pve-node"}]}]}`)
+			fmt.Fprint(w, poolBody)
 		case r.URL.Path == "/nodes/pve-node/status":
 			fmt.Fprint(w, `{"data":{}}`)
-		case r.URL.Path == "/nodes/pve-node/qemu/100/status/current":
-			fmt.Fprint(w, `{"data":{"vmid":100,"name":"fleeting-creating","status":"running"}}`)
-		case r.URL.Path == "/nodes/pve-node/qemu/100/config" && r.Method == http.MethodGet:
+		case memberStatus[r.URL.Path] != "":
+			fmt.Fprint(w, memberStatus[r.URL.Path])
+		case memberConfig[r.URL.Path] && r.Method == http.MethodGet:
 			fmt.Fprint(w, `{"data":{}}`)
-		case r.URL.Path == "/nodes/pve-node/qemu/100/config" && r.Method == http.MethodPost:
+		case memberConfig[r.URL.Path] && r.Method == http.MethodPost:
 			counts.configPOSTs.Add(1)
 			fmt.Fprint(w, configResponse)
 		case strings.Contains(r.URL.Path, "/tasks/") && strings.HasSuffix(r.URL.Path, "/status"):
 			counts.taskPolls.Add(1)
-			fmt.Fprint(w, taskStatusBody("qmconfig", "stopped", "VM is locked (clone)"))
-		case strings.HasSuffix(r.URL.Path, "/log"):
-			fmt.Fprint(w, `{"data":[{"n":1,"t":"TASK ERROR: VM is locked (clone)"}]}`)
+			renameTask(w, r)
 		default:
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
+			renameTask(w, r)
 		}
 	}))
 	t.Cleanup(server.Close)
 
-	waitInterval := 1
 	templateID := 200
 
-	return &InstanceGroup{
-		Settings: Settings{
-			Pool:                    "test-pool",
-			TemplateID:              &templateID,
-			InstanceNameCreating:    "fleeting-creating",
-			InstanceNameRemoving:    "fleeting-removing",
-			InstanceTagsRemoving:    "fleeting-removing",
-			ProxmoxTaskWaitInterval: &waitInterval,
-		},
-		log:                       log,
-		proxmox:                   proxmox.NewClient(server.URL),
-		instanceCollectionTrigger: make(chan struct{}, 1),
-	}
+	ig := newWaitTestGroup()
+	ig.Pool = "test-pool"
+	ig.TemplateID = &templateID
+	ig.InstanceNameCreating = "fleeting-creating"
+	ig.InstanceNameRemoving = "fleeting-removing"
+	ig.InstanceTagsRemoving = "fleeting-removing"
+	ig.log = log
+	ig.proxmox = proxmox.NewClient(server.URL)
+	ig.instanceCollectionTrigger = make(chan struct{}, 1)
+
+	return ig
 }
 
 // Decrease's path: a rename the API accepted whose task then fails must surface as an error,
 // so the instance is not reported as successfully removed.
-func TestMarkInstancesForRemovalReportsTaskFailure(t *testing.T) {
+func TestMarkInstanceForRemovalReportsTaskFailure(t *testing.T) {
 	ig := newRemovalTestGroup(t, removalTestServer{})
 
 	member := &proxmox.ClusterResource{VMID: 100, Type: vmTypeQEMU, Name: "fleeting-creating", Node: "pve-node"}
 
-	err := ig.markInstancesForRemoval(context.Background(), member)
+	err := ig.markInstanceForRemoval(context.Background(), member)
 	require.ErrorIs(t, err, ErrTaskFailed)
 }
 
@@ -209,7 +235,7 @@ func TestMarkInstanceForRemovalRejectsMissingTask(t *testing.T) {
 
 	member := &proxmox.ClusterResource{VMID: 100, Type: vmTypeQEMU, Name: "fleeting-creating", Node: "pve-node"}
 
-	err := ig.markInstancesForRemoval(context.Background(), member)
+	err := ig.markInstanceForRemoval(context.Background(), member)
 	require.ErrorIs(t, err, ErrNoTask)
 	require.Equal(t, int64(1), counts.configPOSTs.Load(), "expected exactly one rename POST")
 	require.Zero(t, counts.taskPolls.Load(), "expected the rename never to be waited on")

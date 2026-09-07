@@ -13,34 +13,25 @@ func TestBatchError(t *testing.T) {
 	errSecond := errors.New("second failure")
 
 	testCases := []struct {
-		name         string
-		succeeded    int
-		failed       int
-		errs         []error
-		expectedErrs []error
+		name    string
+		errs    []error
+		wantErr bool
 	}{
 		{
-			name:      "all succeed",
-			succeeded: 3,
-			errs:      []error{nil, nil, nil},
+			name: "all succeed",
+			errs: []error{nil, nil, nil},
 		},
 		{
-			name:      "partial success is not an error",
-			succeeded: 3,
-			failed:    2,
-			errs:      []error{nil, errFirst, nil, errSecond, nil},
+			name: "partial success is not an error",
+			errs: []error{nil, errFirst, nil, errSecond, nil},
 		},
 		{
-			name:         "all fail",
-			succeeded:    0,
-			failed:       2,
-			errs:         []error{errFirst, errSecond},
-			expectedErrs: []error{errFirst, errSecond},
+			name:    "all attempted failed",
+			errs:    []error{errFirst, errSecond},
+			wantErr: true,
 		},
 		{
-			name:      "nothing attempted",
-			succeeded: 0,
-			errs:      nil,
+			name: "nothing attempted",
 		},
 	}
 
@@ -48,17 +39,16 @@ func TestBatchError(t *testing.T) {
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			err := ig.batchError("batch failed", testCase.succeeded, testCase.failed, testCase.errs)
+			err := ig.batchError("batch failed", testCase.errs)
 
-			if len(testCase.expectedErrs) == 0 {
+			if !testCase.wantErr {
 				require.NoError(t, err)
 
 				return
 			}
 
-			require.Error(t, err)
-
-			for _, expectedErr := range testCase.expectedErrs {
+			// Every individual failure must survive the aggregate.
+			for _, expectedErr := range testCase.errs {
 				require.ErrorIs(t, err, expectedErr)
 			}
 		})
@@ -68,7 +58,7 @@ func TestBatchError(t *testing.T) {
 func TestRunParallel(t *testing.T) {
 	errFirst := errors.New("first failure")
 
-	failed, errs := runParallel(3, func(index int) error {
+	errs := runParallel(3, func(index int) error {
 		if index == 1 {
 			return errFirst
 		}
@@ -78,9 +68,6 @@ func TestRunParallel(t *testing.T) {
 
 	// Every call's error lands in its own slot, so a failure stays matched to its index.
 	require.Equal(t, []error{nil, errFirst, nil}, errs)
-	require.Equal(t, 1, failed)
 
-	failed, errs = runParallel(0, func(int) error { return errFirst })
-	require.Empty(t, errs)
-	require.Zero(t, failed)
+	require.Empty(t, runParallel(0, func(int) error { return errFirst }))
 }

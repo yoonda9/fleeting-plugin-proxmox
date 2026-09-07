@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/luthermonson/go-proxmox"
-	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -176,7 +175,7 @@ func (ig *InstanceGroup) markStaleInstancesForRemoval(ctx context.Context) error
 	// from the previous process, held by a backup, a storage error -- must not stop the plugin
 	// from starting. Each failure is logged with its vmid where it happened; the next Init
 	// retries.
-	err = ig.markInstancesForRemoval(ctx, instancesToMarkForRemoval...)
+	err = errors.Join(ig.markInstancesForRemoval(ctx, instancesToMarkForRemoval)...)
 	if err != nil {
 		ig.log.Error("failed to mark some stale instances for removal, continuing startup",
 			"attempted", len(instancesToMarkForRemoval), "err", err)
@@ -185,57 +184,54 @@ func (ig *InstanceGroup) markStaleInstancesForRemoval(ctx context.Context) error
 	return nil
 }
 
-func (ig *InstanceGroup) markInstancesForRemoval(ctx context.Context, instances ...*proxmox.ClusterResource) error {
-	var errorGroup errgroup.Group
+// markInstanceForRemoval renames and retags one instance so the collector picks it up. The
+// caller owns the batch and triggers the collector once for all of them.
+func (ig *InstanceGroup) markInstanceForRemoval(ctx context.Context, instance *proxmox.ClusterResource) error {
+	log := ig.log.With("name", instance.Name, "vmid", instance.VMID, "node", instance.Node)
 
-	for _, instance := range instances {
-		errorGroup.Go(func() error {
-			log := ig.log.With("name", instance.Name, "vmid", instance.VMID, "node", instance.Node)
+	vm, err := ig.getProxmoxVMOnNode(ctx, int(instance.VMID), instance.Node)
+	if err == nil {
+		var task *proxmox.Task
 
-			vm, err := ig.getProxmoxVMOnNode(ctx, int(instance.VMID), instance.Node)
-			if err != nil {
-				log.Error("Failed to mark instance for removal", "err", err)
-				return fmt.Errorf("failed to mark instance for removal: %w", err)
-			}
+		task, err = vm.Config(ctx,
+			proxmox.VirtualMachineOption{
+				Name:  vmOptName,
+				Value: ig.InstanceNameRemoving,
+			},
+			proxmox.VirtualMachineOption{
+				Name:  vmOptTags,
+				Value: ig.InstanceTagsRemoving,
+			},
+		)
 
-			task, err := vm.Config(ctx,
-				proxmox.VirtualMachineOption{
-					Name:  vmOptName,
-					Value: ig.InstanceNameRemoving,
-				},
-				proxmox.VirtualMachineOption{
-					Name:  vmOptTags,
-					Value: ig.InstanceTagsRemoving,
-				},
-			)
+		if err == nil && task == nil {
+			// The rename is the only evidence the collector will ever see that this instance
+			// is to be removed; with no task there is no evidence it happened.
+			err = ErrNoTask
+		}
 
-			if err == nil && task == nil {
-				// The rename is the only evidence the collector will ever see that this instance
-				// is to be removed; with no task there is no evidence it happened.
-				err = ErrNoTask
-			}
-
-			if err == nil {
-				err = ig.waitTask(ctx, task, proxmoxTaskWaitTimeout)
-			}
-
-			if err != nil {
-				log.Error("Failed to mark instance for removal", "err", err)
-				return fmt.Errorf("failed to mark instance for removal: %w", err)
-			}
-
-			return nil
-		})
+		if err == nil {
+			err = ig.waitTask(ctx, task, proxmoxTaskWaitTimeout)
+		}
 	}
 
-	defer ig.triggerCollection()
-
-	err := errorGroup.Wait()
 	if err != nil {
-		return fmt.Errorf("failed to mark one or more instances for removal: %w", err)
+		log.Error("Failed to mark instance for removal", "err", err)
+
+		return fmt.Errorf("failed to mark instance for removal: %w", err)
 	}
 
 	return nil
+}
+
+// markInstancesForRemoval marks every instance in parallel and wakes the collector once,
+// returning each instance's error in its own slot.
+func (ig *InstanceGroup) markInstancesForRemoval(ctx context.Context, instances []*proxmox.ClusterResource) []error {
+	defer ig.triggerCollection()
+
+	return runParallel(len(instances), func(index int) error {
+		return ig.markInstanceForRemoval(ctx, instances[index])
+	})
 }
 
 func (ig *InstanceGroup) isProxmoxResourceAnInstance(member proxmox.ClusterResource) bool {

@@ -28,20 +28,11 @@ var (
 	// ErrNoTask reports an operation Proxmox accepted without returning a task to wait on, so
 	// its outcome was never observed.
 	ErrNoTask = errors.New("proxmox returned no task")
-
-	// errStillRunning reports a task that has not finished yet. waitTask never returns it --
-	// Task.Wait already blocks until the task stops -- but it lets a per-poll caller tell
-	// "keep waiting" apart from "failed".
-	errStillRunning = errors.New("proxmox task is still running")
 )
 
-// classifyTask decides a task's outcome from what Task.Ping already populated. It is pure so
-// the branch matrix is table-testable without an HTTP server.
+// classifyTask decides a finished task's outcome from what Task.Ping already populated. It is
+// pure so the branch matrix is table-testable without an HTTP server.
 func classifyTask(status, exitStatus string) error {
-	if status == proxmox.TaskRunning {
-		return errStillRunning
-	}
-
 	// Task.Wait returns nil whenever the reported status is anything but running -- including
 	// when a failed or unauthorized /status poll leaves the whole struct blank, which arrives
 	// here as an empty status. Only a task actually observed as stopped can be trusted, so

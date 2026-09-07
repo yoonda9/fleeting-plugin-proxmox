@@ -31,6 +31,24 @@ func taskStatusBody(taskType, status, exitStatus string) string {
 		testUPID(taskType), taskType, status, exitStatus)
 }
 
+// taskHandler serves a task's /status and /log endpoints, reporting the given outcome, and
+// fails the test on any other request. Servers that need more routes fall through to it.
+func taskHandler(t *testing.T, taskType, status, exitStatus, logLine string) http.HandlerFunc {
+	t.Helper()
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			fmt.Fprint(w, taskStatusBody(taskType, status, exitStatus))
+		case strings.HasSuffix(r.URL.Path, "/log"):
+			fmt.Fprintf(w, `{"data":[{"n":1,"t":%q}]}`, logLine)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+}
+
 // newWaitTestGroup is the minimum InstanceGroup waitTask needs: a poll interval and a logger.
 func newWaitTestGroup() *InstanceGroup {
 	waitInterval := 1
@@ -67,11 +85,6 @@ func TestClassifyTask(t *testing.T) {
 			expectText:  "unable to parse volume ID 'local-lvm:'",
 		},
 		{
-			name:        "still running",
-			status:      proxmox.TaskRunning,
-			expectedErr: errStillRunning,
-		},
-		{
 			// An unauthorized or empty /status response leaves the task struct blank, which
 			// Task.Wait reports as no-longer-running. Its exit status is blank too, so falling
 			// through to the exit status check would read a failed poll as success.
@@ -105,17 +118,14 @@ func TestClassifyTask(t *testing.T) {
 func TestInstanceGroup_waitTask(t *testing.T) {
 	var logFetched atomic.Bool
 
+	handler := taskHandler(t, "qmclone", taskStatusStopped, "unable to parse volume ID 'local-lvm:'", "volume parse failed")
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/status"):
-			fmt.Fprint(w, taskStatusBody("qmclone", taskStatusStopped, "unable to parse volume ID 'local-lvm:'"))
-		case strings.HasSuffix(r.URL.Path, "/log"):
+		if strings.HasSuffix(r.URL.Path, "/log") {
 			logFetched.Store(true)
-			fmt.Fprint(w, `{"data":[{"n":1,"t":"volume parse failed"}]}`)
-		default:
-			t.Errorf("unexpected request path: %s", r.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
 		}
+
+		handler(w, r)
 	}))
 	defer server.Close()
 

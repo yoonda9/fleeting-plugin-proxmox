@@ -129,12 +129,11 @@ func (ig *InstanceGroup) Shutdown(_ context.Context) error {
 	return nil
 }
 
-// runParallel calls run once for every index in [0, count), returning how many calls failed
-// alongside each call's error in its own slot, so a failure stays matched to the item that
-// caused it without a lock.
-func runParallel(count int, run func(index int) error) (int, []error) {
+// runParallel calls run once for every index in [0, count), returning each call's error in
+// its own slot so a failure stays matched to the item that caused it without a lock.
+func runParallel(count int, run func(index int) error) []error {
 	if count <= 0 {
-		return 0, nil
+		return nil
 	}
 
 	var waitGroup sync.WaitGroup
@@ -149,15 +148,7 @@ func runParallel(count int, run func(index int) error) (int, []error) {
 
 	waitGroup.Wait()
 
-	failed := 0
-
-	for _, err := range errs {
-		if err != nil {
-			failed++
-		}
-	}
-
-	return failed, errs
+	return errs
 }
 
 // Increase implements provider.InstanceGroup.
@@ -173,7 +164,9 @@ func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 	ig.instanceCloningMu.Lock()
 	defer ig.instanceCloningMu.Unlock()
 
-	failed, errs := runParallel(count, func(_ int) error {
+	succeeded := 0
+
+	errs := runParallel(count, func(_ int) error {
 		vmid, err := ig.deployInstance(ctx, template, cloneMu)
 		if err != nil {
 			ig.log.Error("failed to deploy an instance", "vmid", vmid, "err", err)
@@ -186,9 +179,13 @@ func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 		return nil
 	})
 
-	succeeded := count - failed
+	for _, err := range errs {
+		if err == nil {
+			succeeded++
+		}
+	}
 
-	return succeeded, ig.batchError("failed to deploy some instances", succeeded, failed, errs)
+	return succeeded, ig.batchError("failed to deploy some instances", errs)
 }
 
 // Update implements provider.InstanceGroup.
@@ -247,8 +244,6 @@ func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []strin
 		return []string{}, err
 	}
 
-	// Only members named in instancesToRemove can reach either slice, so that is the bound to
-	// size them by -- the pool holds the whole fleet and is typically far larger.
 	var (
 		succeeded = make([]string, 0, len(instancesToRemove))
 		toRemove  = make([]*proxmox.ClusterResource, 0, len(instancesToRemove))
@@ -282,9 +277,7 @@ func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []strin
 		toRemove = append(toRemove, &member)
 	}
 
-	failed, errs := runParallel(len(toRemove), func(index int) error {
-		return ig.markInstancesForRemoval(ctx, toRemove[index])
-	})
+	errs := ig.markInstancesForRemoval(ctx, toRemove)
 
 	for index, member := range toRemove {
 		if errs[index] == nil {
@@ -292,7 +285,7 @@ func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []strin
 		}
 	}
 
-	return succeeded, ig.batchError("failed to mark some instances for removal", len(succeeded), failed, errs)
+	return succeeded, ig.batchError("failed to mark some instances for removal", errs)
 }
 
 func (ig *InstanceGroup) Heartbeat(ctx context.Context, instance string) error {
@@ -389,12 +382,12 @@ func (ig *InstanceGroup) Suspend(ctx context.Context, instances []string) ([]str
 // Shutdown without the previous cycle's guard blocking the next one.
 func (ig *InstanceGroup) resetLifecycle() {
 	ig.instanceCollectionTrigger = make(chan struct{}, 1)
-	ig.collectorShutdownTrigger = make(chan struct{}, 1)
-	ig.sessionTicketRefresherShutdownTrigger = make(chan struct{}, 1)
+	ig.collectorShutdownTrigger = make(chan struct{})
+	ig.sessionTicketRefresherShutdownTrigger = make(chan struct{})
 	ig.shutdownOnce = sync.Once{}
 }
 
-// batchError reports a batch of instance operations as failed only when nothing at all
+// batchError reports a batch of instance operations as failed only when nothing attempted
 // succeeded, and logs the aggregate trace that decision hides. It is the one place that rule
 // lives, for both Increase and Decrease.
 //
@@ -404,18 +397,25 @@ func (ig *InstanceGroup) resetLifecycle() {
 // leaving instances that were in fact created or removed untracked and classified
 // CauseUnexpected. Each individual failure is already logged where it happened, so the warning
 // here only has to record how much the nil error is hiding.
-//
-// succeeded is a parameter rather than counted from errs because Decrease also counts instances
-// that were already being removed, which errs knows nothing about. An empty errs means nothing
-// was attempted, which errors.Join already reports as success.
-func (ig *InstanceGroup) batchError(msg string, succeeded, failed int, errs []error) error {
-	if succeeded == 0 {
-		return errors.Join(errs...)
+func (ig *InstanceGroup) batchError(msg string, errs []error) error {
+	err := errors.Join(errs...)
+	if err == nil {
+		return nil
 	}
 
-	if failed > 0 {
-		ig.log.Warn(msg, "attempted", len(errs), "failed", failed)
+	failed := 0
+
+	for _, attemptErr := range errs {
+		if attemptErr != nil {
+			failed++
+		}
 	}
+
+	if failed == len(errs) {
+		return err
+	}
+
+	ig.log.Warn(msg, "attempted", len(errs), "failed", failed, "err", err)
 
 	return nil
 }
