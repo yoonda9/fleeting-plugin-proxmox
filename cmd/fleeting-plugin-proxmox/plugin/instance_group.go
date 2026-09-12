@@ -23,10 +23,7 @@ var (
 	ErrSuspendFailed             = errors.New("one or more instances did not suspend successfully")
 )
 
-const (
-	networkCheckTimeout = 5 * time.Second
-	networkCheckRetries = 12
-)
+const networkCheckInterval = 5 * time.Second
 
 type InstanceGroup struct {
 	Settings `json:",inline"`
@@ -35,6 +32,14 @@ type InstanceGroup struct {
 
 	log     hclog.Logger    `json:"-"`
 	proxmox *proxmox.Client `json:"-"`
+
+	// vmids allocates and reserves VMIDs for new clones so two concurrent clones
+	// can never be handed the same ID. See vmid.go.
+	vmids *vmidAllocator `json:"-"`
+
+	// cloneSemaphore bounds concurrent clone tasks (POST through completion) to
+	// clone_concurrency. See instances.go's cloneAndWaitForTemplate.
+	cloneSemaphore chan struct{} `json:"-"`
 
 	// This mutex is used when cloning template for new instances. It is required for blocking other
 	// operations like collection or update, because when new instance is created with recycled ID then for
@@ -81,6 +86,9 @@ func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings
 	if err != nil {
 		return provider.ProviderInfo{}, err
 	}
+
+	ig.vmids = ig.clusterVMIDAllocator()
+	ig.cloneSemaphore = make(chan struct{}, *ig.CloneConcurrency)
 
 	err = ig.markStaleInstancesForRemoval(ctx)
 	if err != nil {
@@ -158,16 +166,13 @@ func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 		return 0, fmt.Errorf("failed to find template with id='%d': %w", *ig.TemplateID, err)
 	}
 
-	// We need to mutex cloning as Proxmox will fail multiple requests in parallel
-	cloneMu := new(sync.Mutex)
-
 	ig.instanceCloningMu.Lock()
 	defer ig.instanceCloningMu.Unlock()
 
 	succeeded := 0
 
 	errs := runParallel(count, func(_ int) error {
-		vmid, err := ig.deployInstance(ctx, template, cloneMu)
+		vmid, err := ig.deployInstance(ctx, template)
 		if err != nil {
 			ig.log.Error("failed to deploy an instance", "vmid", vmid, "err", err)
 
@@ -299,8 +304,17 @@ func (ig *InstanceGroup) Heartbeat(ctx context.Context, instance string) error {
 		return err
 	}
 
-	// Returns an error if the QEMU agent is not communicating due to an empty result
-	_, err = vm.AgentOsInfo(ctx)
+	// Tolerate transient blips (a busy node, a dropped connection) rather than
+	// declaring a healthy instance unhealthy mid-job on the first bad poll.
+	err = retryIdempotent(ctx, *ig.ProxmoxAPIRetryAttempts, proxmoxRetryBackoff, func() error {
+		_, err := vm.AgentOsInfo(ctx)
+
+		// classifyError (inside retryIdempotent) needs the raw go-proxmox error to
+		// recognize a transient 500/501 - wrapping it here would hide that from the
+		// prefix match. The final result is wrapped below instead.
+		//nolint:wrapcheck
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("failed to connect to qemu agent '%s': %w", instance, err)
 	}
@@ -421,7 +435,10 @@ func (ig *InstanceGroup) batchError(msg string, errs []error) error {
 }
 
 func (ig *InstanceGroup) getConnectInfoFromVM(ctx context.Context, instance string, vm *proxmox.VirtualMachine) (provider.ConnectInfo, error) {
-	for retry := range networkCheckRetries {
+	ctx, cancel := context.WithTimeout(ctx, seconds(ig.InstanceConnectTimeout))
+	defer cancel()
+
+	for retry := 0; ; retry++ {
 		networkInterfaces, err := vm.AgentGetNetworkIFaces(ctx)
 		if err != nil {
 			return provider.ConnectInfo{}, fmt.Errorf("failed to retrieve instance vmid='%d' interfaces: %w", vm.VMID, err)
@@ -430,7 +447,12 @@ func (ig *InstanceGroup) getConnectInfoFromVM(ctx context.Context, instance stri
 		internalAddress, externalAddress, err := determineAddresses(networkInterfaces, ig.InstanceNetworkInterface, ig.InstanceNetworkProtocol)
 		if err != nil {
 			ig.log.Error("failed to get network interface", "retry", retry, "vmid", vm.VMID, "err", err)
-			time.Sleep(networkCheckTimeout)
+
+			select {
+			case <-ctx.Done():
+				return provider.ConnectInfo{}, fmt.Errorf("%w vmid='%d'", ErrInstanceConnectionTimeout, vm.VMID)
+			case <-time.After(networkCheckInterval):
+			}
 
 			continue
 		}
@@ -442,6 +464,11 @@ func (ig *InstanceGroup) getConnectInfoFromVM(ctx context.Context, instance stri
 			ConnectorConfig: ig.FleetingSettings.ConnectorConfig,
 		}, nil
 	}
+}
 
-	return provider.ConnectInfo{}, fmt.Errorf("%w vmid='%d'", ErrInstanceConnectionTimeout, vm.VMID)
+// clusterVMIDAllocator builds the allocator that reserves VMIDs against the live cluster.
+func (ig *InstanceGroup) clusterVMIDAllocator() *vmidAllocator {
+	cluster := new(proxmox.Cluster).New(ig.proxmox)
+
+	return newVMIDAllocator(cluster.CheckID, cluster.NextID)
 }

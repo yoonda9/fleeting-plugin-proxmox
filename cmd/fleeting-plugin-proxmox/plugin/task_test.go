@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/luthermonson/go-proxmox"
@@ -27,8 +26,14 @@ func testUPID(taskType string) proxmox.UPID {
 // this payload on every poll, so omitting them would blank out task.UPID after the first poll
 // and crash the second one.
 func taskStatusBody(taskType, status, exitStatus string) string {
-	return fmt.Sprintf(`{"data":{"upid":%q,"node":"pve-node","type":%q,"id":"100","user":"root@pam","status":%q,"exitstatus":%q}}`,
-		testUPID(taskType), taskType, status, exitStatus)
+	return taskStatusBodyFor(string(testUPID(taskType)), taskType, "100", status, exitStatus)
+}
+
+// taskStatusBodyFor is taskStatusBody for any task on the fake node, named by its UPID and the
+// type and id that UPID carries.
+func taskStatusBodyFor(upid, taskType, id, status, exitStatus string) string {
+	return fmt.Sprintf(`{"data":{"upid":%q,"node":"pve-node","type":%q,"id":%q,"user":"root@pam","status":%q,"exitstatus":%q}}`,
+		upid, taskType, id, status, exitStatus)
 }
 
 // taskHandler serves a task's /status and /log endpoints, reporting the given outcome, and
@@ -49,14 +54,21 @@ func taskHandler(t *testing.T, taskType, status, exitStatus, logLine string) htt
 	}
 }
 
-// newWaitTestGroup is the minimum InstanceGroup waitTask needs: a poll interval and a logger.
+// newWaitTestGroup is an InstanceGroup as Init would build it for talking to Proxmox, minus
+// the client: every setting at its default except the ones a wait reads, which are one
+// second, because every fake here answers immediately and a wait still going after a second
+// is a bug, not a slow server.
 func newWaitTestGroup() *InstanceGroup {
-	waitInterval := 1
+	ig := &InstanceGroup{log: hclog.NewNullLogger()}
+	ig.FillWithDefaults()
 
-	return &InstanceGroup{
-		Settings: Settings{ProxmoxTaskWaitInterval: &waitInterval},
-		log:      hclog.NewNullLogger(),
-	}
+	*ig.ProxmoxTaskWaitInterval = 1
+	*ig.ProxmoxTaskWaitTimeout = 1
+	*ig.InstanceAgentStartTimeout = 1
+
+	ig.cloneSemaphore = make(chan struct{}, *ig.CloneConcurrency)
+
+	return ig
 }
 
 func TestClassifyTask(t *testing.T) {
@@ -131,7 +143,7 @@ func TestInstanceGroup_waitTask(t *testing.T) {
 
 	task := proxmox.NewTask(testTaskUPID, proxmox.NewClient(server.URL))
 
-	err := newWaitTestGroup().waitTask(context.Background(), task, time.Second)
+	err := newWaitTestGroup().waitTask(context.Background(), task)
 
 	require.ErrorIs(t, err, ErrTaskFailed)
 	require.Contains(t, err.Error(), "unable to parse volume ID 'local-lvm:'")
@@ -146,6 +158,70 @@ func TestInstanceGroup_waitTaskNilTask(t *testing.T) {
 	group := newWaitTestGroup()
 	group.log = log
 
-	require.NoError(t, group.waitTask(context.Background(), nil, time.Second))
+	require.NoError(t, group.waitTask(context.Background(), nil))
 	require.Regexp(t, `\[WARN\].*Proxmox returned no task to wait on`, logBuffer.String())
+}
+
+// A poll that fails transiently must not end the wait: the task is still progressing on the
+// node, and the blip is the API in front of it. Both spellings of a loaded pveproxy are
+// covered, because they reach classifyError by different routes.
+func TestInstanceGroup_waitTaskKeepsWaitingThroughTransientPolls(t *testing.T) {
+	testCases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{
+			// A 502 with a non-JSON (HTML) body surfaces to the plugin as a JSON decode error
+			// rather than a typed status; classifyError must still treat it as transient.
+			name:   "502 with an HTML body",
+			status: http.StatusBadGateway,
+			body:   "<html>Bad Gateway</html>",
+		},
+		{
+			// A bare 500: go-proxmox's handleResponse returns errors.New(res.Status) for it
+			// without ever reading the body, so this is a genuine status-based classification.
+			// A valid JSON body proves that -- were classifyError relying on a decode failure
+			// instead, this case would not classify as transient and the wait would give up.
+			name:   "500 with a valid JSON body",
+			status: http.StatusInternalServerError,
+			body:   `{"data":{"result":"ok"}}`,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var requests atomic.Int64
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasSuffix(r.URL.Path, "/status") {
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+
+					return
+				}
+
+				// The first two polls fail; the third reports the task done.
+				if requests.Add(1) <= 2 {
+					w.WriteHeader(testCase.status)
+					fmt.Fprint(w, testCase.body)
+
+					return
+				}
+
+				fmt.Fprint(w, taskStatusBody("qmclone", taskStatusStopped, taskExitStatusOK))
+			}))
+			defer server.Close()
+
+			task := proxmox.NewTask(testTaskUPID, proxmox.NewClient(server.URL))
+
+			ig := newWaitTestGroup()
+			*ig.ProxmoxTaskWaitTimeout = 5
+
+			require.NoError(t, ig.waitTask(context.Background(), task))
+			require.GreaterOrEqual(t, requests.Load(), int64(3))
+		})
+	}
 }
