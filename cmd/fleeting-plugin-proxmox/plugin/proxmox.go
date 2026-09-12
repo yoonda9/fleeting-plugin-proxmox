@@ -32,7 +32,7 @@ func (ig *InstanceGroup) getProxmoxVM(ctx context.Context, vmid int) (*proxmox.V
 	}
 
 	for _, member := range pool.Members {
-		if member.Type != "qemu" {
+		if member.Type != vmTypeQEMU {
 			continue
 		}
 

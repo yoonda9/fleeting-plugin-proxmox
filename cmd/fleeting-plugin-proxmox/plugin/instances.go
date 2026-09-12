@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/luthermonson/go-proxmox"
-	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -17,6 +16,8 @@ const (
 
 	vmOptName = "name"
 	vmOptTags = "tags"
+
+	vmTypeQEMU = "qemu"
 )
 
 var ErrCloneVMWithoutConfiguredStorage = errors.New("attempted to clone a VM without configured storage")
@@ -26,7 +27,7 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 	if err == nil {
 		ig.log.Info("Deploying new instance", "vmid", VMID)
 
-		err = task.Wait(ctx, time.Duration(*ig.ProxmoxTaskWaitInterval)*time.Second, proxmoxTaskWaitTimeout)
+		err = ig.waitTask(ctx, task, proxmoxTaskWaitTimeout)
 	}
 
 	if err != nil {
@@ -51,7 +52,7 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 		if ig.InstanceAutoresizeSize != "" {
 			task, err := vm.ResizeDisk(ctx, ig.InstanceAutoresizeDisk, ig.InstanceAutoresizeSize)
 			if err == nil {
-				err = task.Wait(ctx, time.Duration(*ig.ProxmoxTaskWaitInterval)*time.Second, proxmoxTaskWaitTimeout)
+				err = ig.waitTask(ctx, task, proxmoxTaskWaitTimeout)
 			}
 
 			if err != nil {
@@ -62,7 +63,7 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 		// Start the VM
 		task, err := vm.Start(ctx)
 		if err == nil {
-			err = task.Wait(ctx, time.Duration(*ig.ProxmoxTaskWaitInterval)*time.Second, proxmoxTaskWaitTimeout)
+			err = ig.waitTask(ctx, task, proxmoxTaskWaitTimeout)
 		}
 
 		if err != nil {
@@ -169,61 +170,70 @@ func (ig *InstanceGroup) markStaleInstancesForRemoval(ctx context.Context) error
 		return nil
 	}
 
-	err = ig.markInstancesForRemoval(ctx, instancesToMarkForRemoval...)
+	// Best effort: sweeping instances left stale by a previous run is cleanup, not a
+	// precondition for serving, so a VM that cannot be marked -- still locked by a clone task
+	// from the previous process, held by a backup, a storage error -- must not stop the plugin
+	// from starting. Each failure is logged with its vmid where it happened; the next Init
+	// retries.
+	err = errors.Join(ig.markInstancesForRemoval(ctx, instancesToMarkForRemoval)...)
 	if err != nil {
-		return fmt.Errorf("failed to mark stale instances for removal: %w", err)
+		ig.log.Error("failed to mark some stale instances for removal, continuing startup",
+			"attempted", len(instancesToMarkForRemoval), "err", err)
 	}
 
 	return nil
 }
 
-func (ig *InstanceGroup) markInstancesForRemoval(ctx context.Context, instances ...*proxmox.ClusterResource) error {
-	var errorGroup errgroup.Group
+// markInstanceForRemoval renames and retags one instance so the collector picks it up. The
+// caller owns the batch and triggers the collector once for all of them.
+func (ig *InstanceGroup) markInstanceForRemoval(ctx context.Context, instance *proxmox.ClusterResource) error {
+	log := ig.log.With("name", instance.Name, "vmid", instance.VMID, "node", instance.Node)
 
-	for _, instance := range instances {
-		errorGroup.Go(func() error {
-			log := ig.log.With("name", instance.Name, "vmid", instance.VMID, "node", instance.Node)
+	vm, err := ig.getProxmoxVMOnNode(ctx, int(instance.VMID), instance.Node)
+	if err == nil {
+		var task *proxmox.Task
 
-			vm, err := ig.getProxmoxVMOnNode(ctx, int(instance.VMID), instance.Node)
-			if err != nil {
-				log.Error("Failed to mark instance for removal", "err", err)
-				return fmt.Errorf("failed to mark instance for removal: %w", err)
-			}
+		task, err = vm.Config(ctx,
+			proxmox.VirtualMachineOption{
+				Name:  vmOptName,
+				Value: ig.InstanceNameRemoving,
+			},
+			proxmox.VirtualMachineOption{
+				Name:  vmOptTags,
+				Value: ig.InstanceTagsRemoving,
+			},
+		)
 
-			task, err := vm.Config(ctx,
-				proxmox.VirtualMachineOption{
-					Name:  vmOptName,
-					Value: ig.InstanceNameRemoving,
-				},
-				proxmox.VirtualMachineOption{
-					Name:  vmOptTags,
-					Value: ig.InstanceTagsRemoving,
-				},
-			)
-			if err == nil {
-				err = task.Wait(ctx, time.Duration(*ig.ProxmoxTaskWaitInterval)*time.Second, proxmoxTaskWaitTimeout)
-			}
+		if err == nil && task == nil {
+			// The rename is the only evidence the collector will ever see that this instance
+			// is to be removed; with no task there is no evidence it happened.
+			err = ErrNoTask
+		}
 
-			if err != nil {
-				log.Error("Failed to mark instance for removal", "err", err)
-				return fmt.Errorf("failed to mark instance for removal: %w", err)
-			}
-
-			return nil
-		})
+		if err == nil {
+			err = ig.waitTask(ctx, task, proxmoxTaskWaitTimeout)
+		}
 	}
 
-	err := errorGroup.Wait()
 	if err != nil {
-		ig.instanceCollectionTrigger <- struct{}{}
-		return fmt.Errorf("failed to mark one or more instances for removal: %w", err)
-	}
+		log.Error("Failed to mark instance for removal", "err", err)
 
-	ig.instanceCollectionTrigger <- struct{}{}
+		return fmt.Errorf("failed to mark instance for removal: %w", err)
+	}
 
 	return nil
+}
+
+// markInstancesForRemoval marks every instance in parallel and wakes the collector once,
+// returning each instance's error in its own slot.
+func (ig *InstanceGroup) markInstancesForRemoval(ctx context.Context, instances []*proxmox.ClusterResource) []error {
+	defer ig.triggerCollection()
+
+	return runParallel(len(instances), func(index int) error {
+		return ig.markInstanceForRemoval(ctx, instances[index])
+	})
 }
 
 func (ig *InstanceGroup) isProxmoxResourceAnInstance(member proxmox.ClusterResource) bool {
-	return member.Type == "qemu" && member.VMID != uint64(*ig.TemplateID)
+	return member.Type == vmTypeQEMU && member.VMID != uint64(*ig.TemplateID)
 }

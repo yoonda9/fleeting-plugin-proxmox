@@ -7,7 +7,6 @@ require (
 	github.com/luthermonson/go-proxmox v0.8.0
 	github.com/stretchr/testify v1.11.1
 	gitlab.com/gitlab-org/fleeting/fleeting v0.0.0-20260619140500-0eef2584fda6
-	golang.org/x/sync v0.21.0
 )
 
 require (

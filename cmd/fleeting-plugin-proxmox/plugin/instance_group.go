@@ -13,7 +13,6 @@ import (
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/luthermonson/go-proxmox"
 	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
-	"golang.org/x/sync/errgroup"
 )
 
 var _ provider.InstanceGroup = (*InstanceGroup)(nil)
@@ -25,9 +24,8 @@ var (
 )
 
 const (
-	triggerChannelCapacity = 100
-	networkCheckTimeout    = 5 * time.Second
-	networkCheckRetries    = 12
+	networkCheckTimeout = 5 * time.Second
+	networkCheckRetries = 12
 )
 
 type InstanceGroup struct {
@@ -57,15 +55,16 @@ type InstanceGroup struct {
 
 	// Wait group for session ticket refresher.
 	sessionTicketRefresherWaitGroup sync.WaitGroup `json:"-"`
+
+	// Guards the channel closes; re-armed by resetLifecycle.
+	shutdownOnce sync.Once `json:"-"`
 }
 
 // Init implements provider.InstanceGroup.
 func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings provider.Settings) (provider.ProviderInfo, error) {
 	ig.log = logger
 	ig.FleetingSettings = settings
-	ig.instanceCollectionTrigger = make(chan struct{}, triggerChannelCapacity)
-	ig.collectorShutdownTrigger = make(chan struct{}, 1)
-	ig.sessionTicketRefresherShutdownTrigger = make(chan struct{}, 1)
+	ig.resetLifecycle()
 
 	err := ig.CheckRequiredFields()
 	if err != nil {
@@ -104,16 +103,52 @@ func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings
 	}, nil
 }
 
-// Shutdown implements provider.InstanceGroup.
+// Shutdown implements provider.InstanceGroup. It is safe to call repeatedly, and safe to call
+// before Init.
 func (ig *InstanceGroup) Shutdown(_ context.Context) error {
-	ig.collectorShutdownTrigger <- struct{}{}
+	// Before Init there is nothing to close and nothing to wait for, and closing a nil channel
+	// would panic and take the plugin process down. Both channels are only ever created
+	// together in resetLifecycle, so one check covers them. The check stays outside the guard as
+	// defence in depth rather than out of necessity: inside it, a pre-Init call would consume
+	// shutdownOnce without closing anything, and the Shutdown after the next Init would then be
+	// relying on resetLifecycle having re-armed it. resetLifecycle does re-arm it on every Init,
+	// so the placement is not what makes the second cycle work -- it just means Shutdown does not
+	// have to depend on that.
+	if ig.collectorShutdownTrigger == nil {
+		return nil
+	}
 
-	ig.sessionTicketRefresherShutdownTrigger <- struct{}{}
+	ig.shutdownOnce.Do(func() {
+		close(ig.collectorShutdownTrigger)
+		close(ig.sessionTicketRefresherShutdownTrigger)
+	})
 
 	ig.collectorWaitGroup.Wait()
 	ig.sessionTicketRefresherWaitGroup.Wait()
 
 	return nil
+}
+
+// runParallel calls run once for every index in [0, count), returning each call's error in
+// its own slot so a failure stays matched to the item that caused it without a lock.
+func runParallel(count int, run func(index int) error) []error {
+	if count <= 0 {
+		return nil
+	}
+
+	var waitGroup sync.WaitGroup
+
+	errs := make([]error, count)
+
+	for index := range count {
+		waitGroup.Go(func() {
+			errs[index] = run(index)
+		})
+	}
+
+	waitGroup.Wait()
+
+	return errs
 }
 
 // Increase implements provider.InstanceGroup.
@@ -123,41 +158,34 @@ func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 		return 0, fmt.Errorf("failed to find template with id='%d': %w", *ig.TemplateID, err)
 	}
 
-	var (
-		errorGroup = new(errgroup.Group)
-
-		succeeded   = 0
-		succeededMu = new(sync.Mutex)
-
-		// We need to mutex cloning as Proxmox will fail multiple requests in parallel
-		cloneMu = new(sync.Mutex)
-	)
+	// We need to mutex cloning as Proxmox will fail multiple requests in parallel
+	cloneMu := new(sync.Mutex)
 
 	ig.instanceCloningMu.Lock()
 	defer ig.instanceCloningMu.Unlock()
 
-	for range count {
-		errorGroup.Go(func() error {
-			vmid, err := ig.deployInstance(ctx, template, cloneMu)
-			if err != nil {
-				ig.log.Error("failed to deploy an instance", "vmid", vmid, "err", err)
-			}
+	succeeded := 0
 
-			ig.log.Info("successfully deployed instance", "vmid", vmid)
-			succeededMu.Lock()
-			succeeded++
-			succeededMu.Unlock()
+	errs := runParallel(count, func(_ int) error {
+		vmid, err := ig.deployInstance(ctx, template, cloneMu)
+		if err != nil {
+			ig.log.Error("failed to deploy an instance", "vmid", vmid, "err", err)
 
 			return err
-		})
+		}
+
+		ig.log.Info("successfully deployed instance", "vmid", vmid)
+
+		return nil
+	})
+
+	for _, err := range errs {
+		if err == nil {
+			succeeded++
+		}
 	}
 
-	err = errorGroup.Wait()
-	if err != nil {
-		return succeeded, fmt.Errorf("failed to create one or more instances: %w", err)
-	}
-
-	return succeeded, nil
+	return succeeded, ig.batchError("failed to deploy some instances", errs)
 }
 
 // Update implements provider.InstanceGroup.
@@ -217,10 +245,8 @@ func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []strin
 	}
 
 	var (
-		errorGroup = new(errgroup.Group)
-
-		succeeded   = []string{}
-		succeededMu = new(sync.Mutex)
+		succeeded = make([]string, 0, len(instancesToRemove))
+		toRemove  = make([]*proxmox.ClusterResource, 0, len(instancesToRemove))
 	)
 
 	for _, member := range pool.Members {
@@ -228,7 +254,9 @@ func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []strin
 			continue
 		}
 
-		if !slices.Contains(instancesToRemove, strconv.FormatUint(member.VMID, 10)) {
+		vmid := strconv.FormatUint(member.VMID, 10)
+
+		if !slices.Contains(instancesToRemove, vmid) {
 			continue
 		}
 
@@ -239,33 +267,25 @@ func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []strin
 
 		if member.Name == ig.InstanceNameRemoving {
 			// Already deleting...
-			succeededMu.Lock()
-
-			succeeded = append(succeeded, strconv.FormatUint(member.VMID, 10))
-			succeededMu.Unlock()
+			succeeded = append(succeeded, vmid)
 
 			continue
 		}
 
 		ig.log.Info("removing instance", "vmid", member.VMID)
 
-		errorGroup.Go(func() error {
-			err := ig.markInstancesForRemoval(ctx, &member)
-			if err != nil {
-				return err
-			}
-
-			succeededMu.Lock()
-			defer succeededMu.Unlock()
-
-			succeeded = append(succeeded, strconv.FormatUint(member.VMID, 10))
-
-			return nil
-		})
+		toRemove = append(toRemove, &member)
 	}
 
-	//nolint:wrapcheck
-	return succeeded, errorGroup.Wait()
+	errs := ig.markInstancesForRemoval(ctx, toRemove)
+
+	for index, member := range toRemove {
+		if errs[index] == nil {
+			succeeded = append(succeeded, strconv.FormatUint(member.VMID, 10))
+		}
+	}
+
+	return succeeded, ig.batchError("failed to mark some instances for removal", errs)
 }
 
 func (ig *InstanceGroup) Heartbeat(ctx context.Context, instance string) error {
@@ -354,6 +374,50 @@ func (ig *InstanceGroup) Suspend(ctx context.Context, instances []string) ([]str
 	}
 
 	return succeeded, nil
+}
+
+// resetLifecycle creates the worker channels and re-arms the shutdown guard. The wait groups
+// Shutdown waits on need no reset -- a sync.WaitGroup is reusable once Wait has returned -- but
+// everything Shutdown closes is created here, so a group can be initialised again after a
+// Shutdown without the previous cycle's guard blocking the next one.
+func (ig *InstanceGroup) resetLifecycle() {
+	ig.instanceCollectionTrigger = make(chan struct{}, 1)
+	ig.collectorShutdownTrigger = make(chan struct{})
+	ig.sessionTicketRefresherShutdownTrigger = make(chan struct{})
+	ig.shutdownOnce = sync.Once{}
+}
+
+// batchError reports a batch of instance operations as failed only when nothing attempted
+// succeeded, and logs the aggregate trace that decision hides. It is the one place that rule
+// lives, for both Increase and Decrease.
+//
+// A partial success is reported with a NIL error. fleeting's gRPC shim returns the response
+// alongside the error and grpc-go discards the response whenever the error is non-nil, so a
+// partial success reported as an error reaches the provisioner as no instances at all --
+// leaving instances that were in fact created or removed untracked and classified
+// CauseUnexpected. Each individual failure is already logged where it happened, so the warning
+// here only has to record how much the nil error is hiding.
+func (ig *InstanceGroup) batchError(msg string, errs []error) error {
+	err := errors.Join(errs...)
+	if err == nil {
+		return nil
+	}
+
+	failed := 0
+
+	for _, attemptErr := range errs {
+		if attemptErr != nil {
+			failed++
+		}
+	}
+
+	if failed == len(errs) {
+		return err
+	}
+
+	ig.log.Warn(msg, "attempted", len(errs), "failed", failed, "err", err)
+
+	return nil
 }
 
 func (ig *InstanceGroup) getConnectInfoFromVM(ctx context.Context, instance string, vm *proxmox.VirtualMachine) (provider.ConnectInfo, error) {

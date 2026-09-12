@@ -4,9 +4,10 @@ linters:
   disable:
     - depguard
     - exhaustruct
+    - exhaustruct_v5
     - funlen
     - godox
-    - gomodguard # deprecated
+    - gomodguard_v2
     - musttag
     - nlreturn
     - paralleltest
