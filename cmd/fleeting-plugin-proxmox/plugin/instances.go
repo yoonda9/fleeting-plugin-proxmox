@@ -4,16 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
-	"time"
 
 	"github.com/luthermonson/go-proxmox"
 )
 
 const (
-	proxmoxTaskWaitTimeout   = 5 * time.Minute
-	proxmoxAgentStartTimeout = 2 * time.Minute
-
 	vmOptName = "name"
 	vmOptTags = "tags"
 
@@ -22,14 +17,8 @@ const (
 
 var ErrCloneVMWithoutConfiguredStorage = errors.New("attempted to clone a VM without configured storage")
 
-func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.VirtualMachine, cloneMu *sync.Mutex) (int, error) {
-	VMID, task, err := ig.cloneTemplate(ctx, template, cloneMu)
-	if err == nil {
-		ig.log.Info("Deploying new instance", "vmid", VMID)
-
-		err = ig.waitTask(ctx, task, proxmoxTaskWaitTimeout)
-	}
-
+func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.VirtualMachine) (int, error) {
+	VMID, err := ig.cloneAndWaitForTemplate(ctx, template)
 	if err != nil {
 		return VMID, fmt.Errorf("failed to deploy instance: %w", err)
 	}
@@ -52,7 +41,7 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 		if ig.InstanceAutoresizeSize != "" {
 			task, err := vm.ResizeDisk(ctx, ig.InstanceAutoresizeDisk, ig.InstanceAutoresizeSize)
 			if err == nil {
-				err = ig.waitTask(ctx, task, proxmoxTaskWaitTimeout)
+				err = ig.waitTask(ctx, task)
 			}
 
 			if err != nil {
@@ -63,7 +52,7 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 		// Start the VM
 		task, err := vm.Start(ctx)
 		if err == nil {
-			err = ig.waitTask(ctx, task, proxmoxTaskWaitTimeout)
+			err = ig.waitTask(ctx, task)
 		}
 
 		if err != nil {
@@ -71,7 +60,7 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 		}
 
 		// Wait for agent to start
-		err = vm.WaitForAgent(ctx, int(proxmoxAgentStartTimeout/time.Second))
+		err = ig.waitForAgent(ctx, vm)
 		if err != nil {
 			return fmt.Errorf("failed when waiting for qemu agent to start on newly deployed instance: %w", err)
 		}
@@ -109,21 +98,61 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 	return VMID, nil
 }
 
-func (ig *InstanceGroup) cloneTemplate(ctx context.Context, template *proxmox.VirtualMachine, cloneMu *sync.Mutex) (int, *proxmox.Task, error) {
+// cloneAndWaitForTemplate clones the template and waits for the clone task to
+// complete, bounded by clone_concurrency. The semaphore is held across
+// waitTask, not just the POST: Clone returns a UPID immediately and the disk
+// copy happens in Proxmox's forked worker, so a semaphore around the POST
+// alone would bound nothing.
+func (ig *InstanceGroup) cloneAndWaitForTemplate(ctx context.Context, template *proxmox.VirtualMachine) (int, error) {
+	select {
+	case ig.cloneSemaphore <- struct{}{}:
+	case <-ctx.Done():
+		return -1, fmt.Errorf("failed to acquire a clone concurrency slot: %w", ctx.Err())
+	}
+
+	defer func() { <-ig.cloneSemaphore }()
+
+	VMID, task, err := ig.cloneTemplate(ctx, template)
+	if err != nil {
+		return VMID, err
+	}
+
+	ig.log.Info("Deploying new instance", "vmid", VMID)
+
+	err = ig.waitTask(ctx, task)
+	if err != nil {
+		// The clone POST succeeded, so VMID is allocated and Proxmox rolls the
+		// target config back when the clone worker fails - but a wait that
+		// merely timed out may still land, so ReleaseIfFree reconfirms with the
+		// cluster before giving the reservation back rather than risk handing a
+		// live id to another clone.
+		ig.vmids.ReleaseIfFree(ctx, VMID)
+	}
+
+	return VMID, err
+}
+
+func (ig *InstanceGroup) cloneTemplate(ctx context.Context, template *proxmox.VirtualMachine) (int, *proxmox.Task, error) {
 	cloneOptions, err := ig.getTemplateCloneOptions(template)
 	if err != nil {
 		return -1, nil, err
 	}
 
-	cloneMu.Lock()
-	defer cloneMu.Unlock()
-
-	VMID, task, err := template.Clone(ctx, cloneOptions)
+	vmid, err := ig.vmids.Allocate(ctx)
 	if err != nil {
+		return -1, nil, fmt.Errorf("failed to allocate a vmid for the clone: %w", err)
+	}
+
+	cloneOptions.NewID = vmid
+
+	_, task, err := template.Clone(ctx, cloneOptions)
+	if err != nil {
+		ig.vmids.Release(vmid)
+
 		return -1, nil, fmt.Errorf("failed to clone the template: %w", err)
 	}
 
-	return VMID, task, nil
+	return vmid, task, nil
 }
 
 func (ig *InstanceGroup) getTemplateCloneOptions(template *proxmox.VirtualMachine) (*proxmox.VirtualMachineCloneOptions, error) {
@@ -211,7 +240,7 @@ func (ig *InstanceGroup) markInstanceForRemoval(ctx context.Context, instance *p
 		}
 
 		if err == nil {
-			err = ig.waitTask(ctx, task, proxmoxTaskWaitTimeout)
+			err = ig.waitTask(ctx, task)
 		}
 	}
 

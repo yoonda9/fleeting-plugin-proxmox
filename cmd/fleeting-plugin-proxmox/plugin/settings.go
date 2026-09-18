@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
+	"time"
 )
 
 var (
@@ -35,7 +36,20 @@ const (
 	DefaultInstanceNameRunning  = "fleeting-running"
 	DefaultInstanceNameRemoving = "fleeting-removing"
 
-	DefaultProxmoxTaskWaitInterval int = 10
+	DefaultProxmoxTaskWaitInterval   int = 10
+	DefaultProxmoxTaskWaitTimeout    int = 300
+	DefaultInstanceAgentStartTimeout int = 120
+	DefaultInstanceConnectTimeout    int = 60
+	DefaultCollectorInterval         int = 60
+	DefaultHTTPTimeout               int = 60
+	DefaultProxmoxAPIRetryAttempts   int = 3
+	DefaultCloneConcurrency          int = 4
+
+	// DefaultHTTPMaxIdleConnsPerHost is the floor of the derived
+	// http_max_idle_conns_per_host default, max(8, clone_concurrency + 4).
+	DefaultHTTPMaxIdleConnsPerHost int = 8
+
+	idleConnsCloneConcurrencyHeadroom = 4
 )
 
 // Disk index limits for each disk type.
@@ -101,6 +115,34 @@ type Settings struct {
 
 	// How often should task status be queried
 	ProxmoxTaskWaitInterval *int `json:"proxmox_task_wait_interval"`
+
+	// How long to wait for a Proxmox task (clone, resize, start, stop, delete) to complete.
+	ProxmoxTaskWaitTimeout *int `json:"proxmox_task_wait_timeout"`
+
+	// How long to wait for the QEMU guest agent to start on a newly deployed instance.
+	InstanceAgentStartTimeout *int `json:"instance_agent_start_timeout"`
+
+	// How long to wait for a newly deployed instance to report a usable network address.
+	InstanceConnectTimeout *int `json:"instance_connect_timeout"`
+
+	// How often the collector polls for instances to remove.
+	CollectorInterval *int `json:"collector_interval"`
+
+	// Per-request deadline for calls to the Proxmox VE API.
+	HTTPTimeout *int `json:"http_timeout"`
+
+	// Maximum idle HTTP connections to keep open per Proxmox VE host.
+	// Defaults to max(8, clone_concurrency + 4), so idle connections scale
+	// with the number of clones that can be in flight at once.
+	HTTPMaxIdleConnsPerHost *int `json:"http_max_idle_conns_per_host"`
+
+	// How many times a read-only Proxmox API call that keeps failing transiently is
+	// attempted in total, the first try included - so 1 means no retry at all and the
+	// default of 3 means two retries.
+	ProxmoxAPIRetryAttempts *int `json:"proxmox_api_retry_attempts"`
+
+	// Maximum number of clone tasks (POST through completion) in flight at once.
+	CloneConcurrency *int `json:"clone_concurrency"`
 }
 
 func (s *Settings) FillWithDefaults() {
@@ -124,10 +166,30 @@ func (s *Settings) FillWithDefaults() {
 		s.InstanceNetworkProtocol = DefaultInstanceNetworkProtocol
 	}
 
-	if s.ProxmoxTaskWaitInterval == nil {
-		s.ProxmoxTaskWaitInterval = new(int)
-		*s.ProxmoxTaskWaitInterval = DefaultProxmoxTaskWaitInterval
+	defaultInt(&s.ProxmoxTaskWaitInterval, DefaultProxmoxTaskWaitInterval)
+	defaultInt(&s.ProxmoxTaskWaitTimeout, DefaultProxmoxTaskWaitTimeout)
+	defaultInt(&s.InstanceAgentStartTimeout, DefaultInstanceAgentStartTimeout)
+	defaultInt(&s.InstanceConnectTimeout, DefaultInstanceConnectTimeout)
+	defaultInt(&s.CollectorInterval, DefaultCollectorInterval)
+	defaultInt(&s.HTTPTimeout, DefaultHTTPTimeout)
+	defaultInt(&s.ProxmoxAPIRetryAttempts, DefaultProxmoxAPIRetryAttempts)
+	defaultInt(&s.CloneConcurrency, DefaultCloneConcurrency)
+	// Each in-flight clone holds an HTTP connection open, so the idle pool scales with
+	// clone_concurrency (plus headroom for everything else) instead of a flat default
+	// that left a raised clone_concurrency reopening connections mid-burst.
+	defaultInt(&s.HTTPMaxIdleConnsPerHost, max(DefaultHTTPMaxIdleConnsPerHost, *s.CloneConcurrency+idleConnsCloneConcurrencyHeadroom))
+}
+
+// defaultInt points an unset optional integer setting at its default.
+func defaultInt(setting **int, value int) {
+	if *setting == nil {
+		*setting = &value
 	}
+}
+
+// seconds converts a settings value denominated in seconds to a Duration.
+func seconds(setting *int) time.Duration {
+	return time.Duration(*setting) * time.Second
 }
 
 func (s *Settings) CheckRequiredFields() error {
@@ -145,6 +207,7 @@ func (s *Settings) CheckRequiredFields() error {
 		{"instance_autoresize_disk", s.validateInstanceAutoresizeDisk},
 		{"instance_autoresize_size", s.validateInstanceAutoresizeSize},
 		{"instance_autoresize_consistency", s.validateInstanceAutoresizeConsistency},
+		{"positive_settings", s.validatePositiveSettings},
 	}
 
 	for _, v := range validators {
@@ -238,6 +301,42 @@ func (s *Settings) validateInstanceAutoresizeDisk() error {
 
 	if i > maxIndex {
 		return fmt.Errorf("%w: instance_autoresize_disk: disk type is valid, but index %s is not possible", ErrSettingInvalidParameter, matches[2])
+	}
+
+	return nil
+}
+
+// settingUnit is the unit an error message quotes for a positive integer setting.
+type settingUnit string
+
+const (
+	unitSeconds     settingUnit = "seconds"
+	unitConnections settingUnit = "connections"
+	unitAttempts    settingUnit = "attempts"
+	unitClones      settingUnit = "clones"
+)
+
+// validatePositiveSettings checks every optional integer setting that must be positive when
+// set. Each entry names the setting as the operator spells it and the unit the error quotes.
+func (s *Settings) validatePositiveSettings() error {
+	for _, setting := range []struct {
+		name  string
+		unit  settingUnit
+		value *int
+	}{
+		{"proxmox_task_wait_interval", unitSeconds, s.ProxmoxTaskWaitInterval},
+		{"proxmox_task_wait_timeout", unitSeconds, s.ProxmoxTaskWaitTimeout},
+		{"instance_agent_start_timeout", unitSeconds, s.InstanceAgentStartTimeout},
+		{"instance_connect_timeout", unitSeconds, s.InstanceConnectTimeout},
+		{"collector_interval", unitSeconds, s.CollectorInterval},
+		{"http_timeout", unitSeconds, s.HTTPTimeout},
+		{"http_max_idle_conns_per_host", unitConnections, s.HTTPMaxIdleConnsPerHost},
+		{"proxmox_api_retry_attempts", unitAttempts, s.ProxmoxAPIRetryAttempts},
+		{"clone_concurrency", unitClones, s.CloneConcurrency},
+	} {
+		if setting.value != nil && *setting.value <= 0 {
+			return fmt.Errorf("%w: %s: must be a positive number of %s", ErrSettingInvalidParameter, setting.name, setting.unit)
+		}
 	}
 
 	return nil
