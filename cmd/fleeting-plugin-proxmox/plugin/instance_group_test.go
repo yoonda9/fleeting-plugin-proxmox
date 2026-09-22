@@ -421,6 +421,123 @@ func TestDecreaseOwnership(t *testing.T) {
 	}
 }
 
+// TestRPCsRefuseForeignInstance verifies that ConnectInfo, Heartbeat, Resume, and Suspend all
+// refuse to act on a VM whose listed or fetched name is not owned by this group, with a message
+// that names the vmid and the foreign name. A VM listed under a foreign name gets no per-vmid
+// API request at all; one listed under our name but fetched under a foreign one gets only the
+// fetch that revealed it.
+func TestRPCsRefuseForeignInstance(t *testing.T) {
+	members := []removalTestMember{
+		{vmid: 100, name: "fleeting-running"},
+		{vmid: 101, name: "other-running"},
+		{vmid: 102, name: "fleeting-running", fetchedName: "other-running"},
+		{vmid: 103, name: "", fetchedName: "fleeting-running"},
+	}
+
+	t.Run("ConnectInfo refusal", func(t *testing.T) {
+		counts := &removalRequestCounts{}
+		ig := newRemovalTestGroup(t, removalTestServer{members: members, requests: counts})
+
+		_, err := ig.ConnectInfo(context.Background(), "101")
+		require.ErrorIs(t, err, ErrNotOwned)
+		require.Contains(t, err.Error(), "failed to retrieve instance vmid='101'")
+		require.Contains(t, err.Error(), "other-running")
+		require.Empty(t, counts.requestsFor(101))
+	})
+
+	t.Run("Heartbeat refusal", func(t *testing.T) {
+		counts := &removalRequestCounts{}
+		ig := newRemovalTestGroup(t, removalTestServer{members: members, requests: counts})
+
+		err := ig.Heartbeat(context.Background(), "101")
+		require.ErrorIs(t, err, ErrNotOwned)
+		require.Contains(t, err.Error(), "failed to retrieve instance vmid='101'")
+		require.Contains(t, err.Error(), "other-running")
+		require.Empty(t, counts.requestsFor(101))
+	})
+
+	t.Run("Resume refusal", func(t *testing.T) {
+		counts := &removalRequestCounts{}
+		ig := newRemovalTestGroup(t, removalTestServer{members: members, requests: counts})
+
+		succeeded, err := ig.Resume(context.Background(), []string{"100", "101"})
+		require.Equal(t, []string{"100"}, succeeded)
+		require.ErrorIs(t, err, ErrResumeFailed)
+		require.Contains(t, err.Error(), "not owned")
+		require.Empty(t, counts.requestsFor(101))
+		require.True(t, counts.requested(100, "", "status/resume"), "vm 100 should have received a resume request")
+	})
+
+	t.Run("Suspend refusal", func(t *testing.T) {
+		counts := &removalRequestCounts{}
+		ig := newRemovalTestGroup(t, removalTestServer{members: members, requests: counts})
+
+		succeeded, err := ig.Suspend(context.Background(), []string{"100", "101"})
+		require.Equal(t, []string{"100"}, succeeded)
+		require.ErrorIs(t, err, ErrSuspendFailed)
+		require.Contains(t, err.Error(), "not owned")
+		require.Empty(t, counts.requestsFor(101))
+		require.True(t, counts.requested(100, "", "status/suspend"), "vm 100 should have received a suspend request")
+	})
+
+	t.Run("Heartbeat control", func(t *testing.T) {
+		counts := &removalRequestCounts{}
+		ig := newRemovalTestGroup(t, removalTestServer{members: members, requests: counts})
+
+		err := ig.Heartbeat(context.Background(), "100")
+		require.NoError(t, err)
+		require.True(t, counts.requested(100, "", "agent/get-osinfo"), "vm 100 should have received an agent/get-osinfo request")
+	})
+
+	// An unnamed listing is no evidence of a foreign VM: the fetched name decides.
+	t.Run("Heartbeat control: unnamed listing", func(t *testing.T) {
+		counts := &removalRequestCounts{}
+		ig := newRemovalTestGroup(t, removalTestServer{members: members, requests: counts})
+
+		err := ig.Heartbeat(context.Background(), "103")
+		require.NoError(t, err)
+		require.True(t, counts.requested(103, "", "agent/get-osinfo"), "vm 103 should have received an agent/get-osinfo request")
+	})
+
+	// Listed under our name, fetched under a foreign one: every RPC refuses without acting.
+	fetchedForeign := []struct {
+		name string
+		call func(ig *InstanceGroup) error
+	}{
+		{"ConnectInfo", func(ig *InstanceGroup) error {
+			_, err := ig.ConnectInfo(context.Background(), "102")
+
+			return err
+		}},
+		{"Heartbeat", func(ig *InstanceGroup) error { return ig.Heartbeat(context.Background(), "102") }},
+		{"Resume", func(ig *InstanceGroup) error {
+			_, err := ig.Resume(context.Background(), []string{"102"})
+
+			return err
+		}},
+		{"Suspend", func(ig *InstanceGroup) error {
+			_, err := ig.Suspend(context.Background(), []string{"102"})
+
+			return err
+		}},
+	}
+
+	for _, tc := range fetchedForeign {
+		t.Run(tc.name+" refusal: fetched name", func(t *testing.T) {
+			counts := &removalRequestCounts{}
+			ig := newRemovalTestGroup(t, removalTestServer{members: members, requests: counts})
+
+			err := tc.call(ig)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "vmid='102' is named \"other-running\": not owned")
+
+			for _, route := range []string{"agent/", "status/resume", "status/suspend"} {
+				require.False(t, counts.requested(102, "", route), "acted on vm 102 via %q: %v", route, counts.requestsFor(102))
+			}
+		})
+	}
+}
+
 // Increase must not report a partially successful batch as an error. fleeting's gRPC shim
 // returns the response alongside the error and grpc-go discards the response whenever the
 // error is non-nil, so the instances that did come up would reach the provisioner as no

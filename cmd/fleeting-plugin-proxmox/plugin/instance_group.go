@@ -221,7 +221,7 @@ func (ig *InstanceGroup) ConnectInfo(ctx context.Context, instance string) (prov
 		return provider.ConnectInfo{}, fmt.Errorf("failed to parse instance name '%s': %w", instance, err)
 	}
 
-	vm, err := ig.getProxmoxVM(ctx, VMID)
+	vm, err := ig.ownedInstance(ctx, VMID)
 	if err != nil {
 		return provider.ConnectInfo{}, fmt.Errorf("failed to retrieve instance vmid='%d': %w", VMID, err)
 	}
@@ -303,9 +303,9 @@ func (ig *InstanceGroup) Heartbeat(ctx context.Context, instance string) error {
 		return fmt.Errorf("invalid vm id '%s': %w", instance, err)
 	}
 
-	vm, err := ig.getProxmoxVM(ctx, vmid)
+	vm, err := ig.ownedInstance(ctx, vmid)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to retrieve instance vmid='%d': %w", vmid, err)
 	}
 
 	// Returns an error if the QEMU agent is not communicating due to an empty result
@@ -329,9 +329,9 @@ func (ig *InstanceGroup) Resume(ctx context.Context, instances []string) ([]stri
 			continue
 		}
 
-		vm, err := ig.getProxmoxVM(ctx, vmid)
+		vm, err := ig.ownedInstance(ctx, vmid)
 		if err != nil {
-			errs = append(errs, fmt.Sprintf("no vm with id '%d'", vmid))
+			errs = append(errs, fmt.Sprintf("vm id '%d': %v", vmid, err))
 			continue
 		}
 
@@ -363,9 +363,9 @@ func (ig *InstanceGroup) Suspend(ctx context.Context, instances []string) ([]str
 			continue
 		}
 
-		vm, err := ig.getProxmoxVM(ctx, vmid)
+		vm, err := ig.ownedInstance(ctx, vmid)
 		if err != nil {
-			errs = append(errs, fmt.Sprintf("no vm with id '%d'", vmid))
+			errs = append(errs, fmt.Sprintf("vm id '%d': %v", vmid, err))
 			continue
 		}
 

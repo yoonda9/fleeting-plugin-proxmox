@@ -98,8 +98,9 @@ type removalTestServer struct {
 	requests *removalRequestCounts
 }
 
-// removalTestMember is one VM in the fake's pool. It appears in the pool listing and answers a
-// status and a config fetch under its own vmid, which is everything a rename needs.
+// removalTestMember is one VM in the fake's pool. It appears in the pool listing and, under its
+// own vmid, answers the status and config fetches and the rename, stop, delete, agent OS-info,
+// resume and suspend requests.
 type removalTestMember struct {
 	vmid uint64
 	name string
@@ -253,6 +254,12 @@ func newRemovalTestGroup(t *testing.T, opts removalTestServer) *InstanceGroup {
 			fmt.Fprintf(w, `{"data":%q}`, testUPID("qmstop"))
 		case route == "DELETE ":
 			fmt.Fprintf(w, `{"data":%q}`, testUPID("qmdestroy"))
+		case route == "GET agent/get-osinfo":
+			fmt.Fprint(w, `{"data":{"result":{}}}`)
+		case route == "POST status/resume":
+			fmt.Fprintf(w, `{"data":%q}`, testUPID("qmresume"))
+		case route == "POST status/suspend":
+			fmt.Fprintf(w, `{"data":%q}`, testUPID("qmsuspend"))
 		default:
 			renameTask(w, r)
 		}
