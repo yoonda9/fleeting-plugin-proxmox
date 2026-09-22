@@ -17,7 +17,8 @@ import (
 var (
 	ErrNotFound = errors.New("not found")
 	// ErrNotOwned reports a VM that is in the pool but does not carry one of this
-	// config's instance names.
+	// config's instance names, or, to getListedVM, no longer carries the one it was
+	// listed and selected under.
 	ErrNotOwned = errors.New("not owned by this instance group")
 )
 
@@ -54,7 +55,9 @@ func (ig *InstanceGroup) findPoolMember(ctx context.Context, vmid int) (proxmox.
 }
 
 // Where possible, use getProxmoxVMOnNode instead as it makes less calls to API. It does not
-// check ownership; lifecycle operations on instances go through ownedInstance instead.
+// check ownership: Increase uses it for the template and deployInstance for the VM it has just
+// cloned. fleeting's per-instance RPCs go through ownedInstance, and the removal paths through
+// getListedVM once they have selected a VM by its listed name.
 func (ig *InstanceGroup) getProxmoxVM(ctx context.Context, vmid int) (*proxmox.VirtualMachine, error) {
 	member, err := ig.findPoolMember(ctx, vmid)
 	if err != nil {
@@ -142,6 +145,32 @@ func (ig *InstanceGroup) ownedInstance(ctx context.Context, vmid int) (*proxmox.
 	}
 
 	if name := fetchedName(vm); !ig.isOwnName(name) {
+		return nil, notOwned(member.VMID, name)
+	}
+
+	return vm, nil
+}
+
+// getListedVM fetches a pool member listed under one of this group's names on its node and
+// refuses it unless the VM still carries the name it was listed under: the pool listing and
+// the node fetch are not atomic, and another manager may have renamed the VM between them.
+// The one other name let through is InstanceNameRemoving: only this group renames a VM to
+// it, and the listing trails a rename by several seconds, so a VM fetched under it is one this
+// group has already marked.
+func (ig *InstanceGroup) getListedVM(ctx context.Context, member *proxmox.ClusterResource) (*proxmox.VirtualMachine, error) {
+	if !ig.isOwnName(member.Name) {
+		return nil, notOwned(member.VMID, member.Name)
+	}
+
+	vm, err := ig.getProxmoxVMOnNode(ctx, int(member.VMID), member.Node)
+	if err != nil {
+		return nil, err
+	}
+
+	if name := fetchedName(vm); name != member.Name && name != ig.InstanceNameRemoving {
+		ig.log.Warn("refusing to act on VM: renamed since pool listing",
+			"vmid", member.VMID, "listed", member.Name, "found", name)
+
 		return nil, notOwned(member.VMID, name)
 	}
 

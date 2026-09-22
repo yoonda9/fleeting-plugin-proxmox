@@ -3,6 +3,7 @@ package plugin
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -272,6 +273,69 @@ func TestMarkStaleInstancesForRemovalToleratesTaskFailure(t *testing.T) {
 	err := ig.markStaleInstancesForRemoval(context.Background())
 	require.NoError(t, err)
 	require.Regexp(t, `\[ERROR\].*continuing startup`, logBuffer.String())
+}
+
+// markInstanceForRemoval must refuse a VM whose fetched name differs from the listed name used
+// to select it. The pool listing and the node fetch are not atomic; between them another
+// manager may have renamed the VM. Acting on the stale listing would rename a VM we do not own.
+func TestMarkInstanceForRemovalRefusesRenamedVM(t *testing.T) {
+	type row struct {
+		name        string
+		fetchedName string
+		wantErr     error
+		wantPOSTs   int64
+	}
+
+	rows := []row{
+		{
+			// Fetched name differs from listed name: refuse.
+			name:        "renamed since listing",
+			fetchedName: "other-creating",
+			wantErr:     ErrNotOwned,
+		},
+		{
+			// Renamed to another of our own names: still not the VM that was selected.
+			name:        "renamed to another own name",
+			fetchedName: "fleeting-running",
+			wantErr:     ErrNotOwned,
+		},
+		{
+			// Already marked by an earlier attempt the listing has not caught up with: done.
+			name:        "already marked for removal",
+			fetchedName: "fleeting-removing",
+		},
+		{
+			// No override: fetched name matches listed name; the task fails as usual.
+			name:      "control: no rename, task fails",
+			wantErr:   ErrTaskFailed,
+			wantPOSTs: 1,
+		},
+	}
+
+	for _, tc := range rows {
+		t.Run(tc.name, func(t *testing.T) {
+			log, logBuf := newLogBuffer(t)
+			counts := &removalRequestCounts{}
+			ig := newRemovalTestGroup(t, removalTestServer{
+				log: log,
+				members: []removalTestMember{
+					{vmid: 100, name: "fleeting-creating", fetchedName: tc.fetchedName},
+				},
+				requests: counts,
+			})
+
+			member := &proxmox.ClusterResource{VMID: 100, Type: vmTypeQEMU, Name: "fleeting-creating", Node: "pve-node"}
+
+			err := ig.markInstanceForRemoval(context.Background(), member)
+			require.ErrorIs(t, err, tc.wantErr)
+			require.Equal(t, tc.wantPOSTs, counts.configPOSTs.Load(), "config POST count")
+
+			if errors.Is(tc.wantErr, ErrNotOwned) {
+				require.Regexp(t, `\[WARN\]`, logBuf.String(), "expected a Warn for the renamed VM")
+				require.Contains(t, err.Error(), fmt.Sprintf("vmid='100' is named %q", tc.fetchedName))
+			}
+		})
+	}
 }
 
 // The rename is the only evidence the collector will ever see that an instance is to be

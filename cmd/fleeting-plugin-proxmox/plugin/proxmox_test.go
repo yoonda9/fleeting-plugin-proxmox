@@ -6,6 +6,7 @@ import (
 	"path"
 	"testing"
 
+	"github.com/luthermonson/go-proxmox"
 	"github.com/stretchr/testify/require"
 	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
 )
@@ -164,6 +165,23 @@ func TestStateForName(t *testing.T) {
 		_, ok := ig.stateForName(name)
 		require.False(t, ok, "%q must not be one of this group's names", name)
 	}
+}
+
+// getListedVM must refuse a member listed under a foreign name before any request to its node,
+// whatever its caller selected it by.
+func TestGetListedVMRefusesForeignListing(t *testing.T) {
+	counts := &removalRequestCounts{}
+	ig := newRemovalTestGroup(t, removalTestServer{
+		members:  []removalTestMember{{vmid: 100, name: "other-running"}},
+		requests: counts,
+	})
+
+	member := &proxmox.ClusterResource{VMID: 100, Type: vmTypeQEMU, Name: "other-running", Node: "pve-node"}
+
+	vm, err := ig.getListedVM(context.Background(), member)
+	require.ErrorIs(t, err, ErrNotOwned)
+	require.Nil(t, vm)
+	require.Empty(t, counts.requestsFor(100))
 }
 
 // TestGetProxmoxVMIgnoresName guards the regression: getProxmoxVM must resolve any pool member regardless

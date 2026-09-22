@@ -189,7 +189,13 @@ func (ig *InstanceGroup) markStaleInstancesForRemoval(ctx context.Context) error
 func (ig *InstanceGroup) markInstanceForRemoval(ctx context.Context, instance *proxmox.ClusterResource) error {
 	log := ig.log.With("name", instance.Name, "vmid", instance.VMID, "node", instance.Node)
 
-	vm, err := ig.getProxmoxVMOnNode(ctx, int(instance.VMID), instance.Node)
+	vm, err := ig.getListedVM(ctx, instance)
+	if err == nil && fetchedName(vm) == ig.InstanceNameRemoving {
+		// Already marked, by an earlier attempt whose rename the listing has not caught up
+		// with. Renaming it again would change nothing.
+		return nil
+	}
+
 	if err == nil {
 		var task *proxmox.Task
 

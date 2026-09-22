@@ -360,6 +360,20 @@ func TestDecreaseOwnership(t *testing.T) {
 			wantErr:   ErrTaskFailed,
 		},
 		{
+			// Pool lists under our name but the VM was renamed before we fetched it (lag
+			// window). The rename must be refused and the instance is not in succeeded.
+			name:    "lag: listed fleeting-running fetched other-running",
+			members: []removalTestMember{{vmid: 100, name: "fleeting-running", fetchedName: foreignRunning}},
+			wantErr: ErrNotOwned,
+		},
+		{
+			// An earlier attempt's rename landed but the listing still trails it: the VM is
+			// already marked, so it is reported without a second rename.
+			name:     "lag: listed fleeting-running fetched fleeting-removing",
+			members:  []removalTestMember{{vmid: 100, name: "fleeting-running", fetchedName: "fleeting-removing"}},
+			wantSucc: []string{"100"},
+		},
+		{
 			// No name in the listing (Proxmox has no fresh status for the VM): the name on the
 			// VM decides, and our own running VM is still renamed.
 			name:      "unnamed listing, fetched fleeting-running",
