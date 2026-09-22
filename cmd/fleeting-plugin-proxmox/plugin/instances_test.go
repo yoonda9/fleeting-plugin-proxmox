@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -131,6 +132,14 @@ func (c *removalRequestCounts) requestsFor(vmid uint64) []string {
 		}
 	}
 	return out
+}
+
+// requested reports whether any recorded request for vmid used method and a path containing
+// substr; an empty method matches any.
+func (c *removalRequestCounts) requested(vmid uint64, method, substr string) bool {
+	return slices.ContainsFunc(c.requestsFor(vmid), func(p string) bool {
+		return strings.HasPrefix(p, method) && strings.Contains(p, substr)
+	})
 }
 
 // newLogBuffer returns a logger and the buffer it writes to, so a test can assert on what a

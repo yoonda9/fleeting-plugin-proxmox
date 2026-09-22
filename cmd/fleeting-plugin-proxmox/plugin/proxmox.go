@@ -109,6 +109,21 @@ func (ig *InstanceGroup) isOwnName(name string) bool {
 	return ok
 }
 
+// nameFromNode fills in the name of a pool member the listing returned without one. Proxmox
+// takes a member's listed name from its status cache, which holds no entry for a VM whose node
+// has not reported for five minutes (pvestatd stalled, pmxcfs just restarted). An empty name
+// says nothing about who owns the VM; the name on the VM itself does.
+func (ig *InstanceGroup) nameFromNode(ctx context.Context, member *proxmox.ClusterResource) error {
+	vm, err := ig.getProxmoxVMOnNode(ctx, int(member.VMID), member.Node)
+	if err != nil {
+		return err
+	}
+
+	member.Name = fetchedName(vm)
+
+	return nil
+}
+
 func (ig *InstanceGroup) ownedInstance(ctx context.Context, vmid int) (*proxmox.VirtualMachine, error) {
 	member, err := ig.findPoolMember(ctx, vmid)
 	if err != nil {

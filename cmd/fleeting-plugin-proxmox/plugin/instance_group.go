@@ -252,21 +252,38 @@ func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []strin
 			continue
 		}
 
-		if member.Name == ig.InstanceNameCreating {
-			// It must be running to start the deletion
-			continue
+		if member.Name == "" {
+			// No name in the listing is not a foreign name: ask the VM itself, or the default
+			// arm would report our own VM removed and leave it running.
+			nameErr := ig.nameFromNode(ctx, &member)
+			if nameErr != nil {
+				ig.log.Warn("cannot read the name of an instance to remove, will retry", "vmid", member.VMID, "err", nameErr)
+
+				continue
+			}
 		}
 
-		if member.Name == ig.InstanceNameRemoving {
-			// Already deleting...
+		state, owned := ig.stateForName(member.Name)
+
+		switch {
+		case !owned:
+			// Another manager's VM, or a VMID reused since fleeting last saw it. Never touch it.
+			// Report it removed so the provisioner stops asking; Update no longer lists it, so
+			// it is pruned on the next cycle either way. Not an attempt: it must not count
+			// toward batchError.
+			ig.log.Warn("refusing to remove instance not owned by this group", "vmid", member.VMID, "name", member.Name)
+
 			succeeded = append(succeeded, vmid)
-
+		case state == provider.StateCreating:
+			// Must be running to start the deletion; provisioner retries.
 			continue
+		case state == provider.StateDeleting:
+			// Already deleting; count as succeeded without a new request.
+			succeeded = append(succeeded, vmid)
+		case state == provider.StateRunning:
+			ig.log.Info("removing instance", "vmid", member.VMID)
+			toRemove = append(toRemove, &member)
 		}
-
-		ig.log.Info("removing instance", "vmid", member.VMID)
-
-		toRemove = append(toRemove, &member)
 	}
 
 	errs := ig.markInstancesForRemoval(ctx, toRemove)
