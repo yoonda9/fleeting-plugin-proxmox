@@ -62,6 +62,26 @@ After creating a **DEDICATED** user, pool and storage follow procedure below to 
 5. Add following role for the user to the node with the storage, network, template etc.:
     * `PVEAuditor` without propagation.
 
+### Running several managers on one host
+
+Give every runner manager its own user, its own pool, its own template and its own
+`instance_name_creating`, `instance_name_running` and `instance_name_removing` values: three
+different names that no other manager uses. The user's permissions should cover only that
+manager's pool: Proxmox checks every VM operation against the pool the VM is in, so a user with
+rights on one pool cannot touch another manager's VMs even if a VM ID is reused between them. A
+VM belongs to at most one pool and the plugin looks its template up in its own pool, so managers
+that start from the same image each need their own copy of the template in their own pool.
+
+On top of that, apart from the VM it has just cloned, the plugin only renames, deletes, or
+connects to VMs that carry one of its own three names, and it checks the name both in the pool
+listing and on the VM itself before acting. A VM with any other name is left alone. This is what
+protects managers that share a user or a pool, and it only holds once all of them run a plugin
+version with this check: an older one renames any VM it is asked to remove unless the VM carries
+its own creating or removing name, even when the VM ID now belongs to another manager.
+
+Known limitation: managers that share a pool cannot tell each other's VMs apart by any
+instance name they have in common, including a name left at its default.
+
 ## Development
 
 ### Integration tests
