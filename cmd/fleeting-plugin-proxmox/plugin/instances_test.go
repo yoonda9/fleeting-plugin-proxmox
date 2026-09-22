@@ -107,6 +107,9 @@ type removalTestMember struct {
 	// test can simulate a VM renamed since the pool was listed. status/current keeps serving
 	// the listed name, which pins fetchedName's preference for the config.
 	fetchedName string
+	// fetchedNameAfterStop, when set, replaces fetchedName once the VM has been asked to stop,
+	// so a test can simulate a VM renamed while the collector waited for the stop.
+	fetchedNameAfterStop string
 }
 
 // removalRequestCounts records how often the fake was asked for each of the two things a
@@ -120,15 +123,16 @@ type removalRequestCounts struct {
 	paths       []string // method + " " + path for every request; guarded by mu
 }
 
-// requestsFor returns the recorded request entries that contain /qemu/<vmid>/ so a test can
-// assert on exactly which operations were performed for a specific VM.
+// requestsFor returns the recorded request entries for /qemu/<vmid> itself (the route a VM
+// DELETE uses) and every route below it, so a test can assert on exactly which operations
+// were performed for a specific VM.
 func (c *removalRequestCounts) requestsFor(vmid uint64) []string {
-	filter := fmt.Sprintf("/qemu/%d/", vmid)
+	vmPath := fmt.Sprintf("/qemu/%d", vmid)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var out []string
 	for _, p := range c.paths {
-		if strings.Contains(p, filter) {
+		if strings.HasSuffix(p, vmPath) || strings.Contains(p, vmPath+"/") {
 			out = append(out, p)
 		}
 	}
@@ -153,8 +157,9 @@ func newLogBuffer(t *testing.T) (hclog.Logger, *bytes.Buffer) {
 	return hclog.New(&hclog.LoggerOptions{Output: buf}), buf
 }
 
-// newRemovalTestGroup wires an InstanceGroup to an httptest Proxmox holding one stale
-// instance whose mark-for-removal rename is accepted by the API but whose task then fails.
+// newRemovalTestGroup wires an InstanceGroup to an httptest Proxmox serving opts.members, by
+// default one stale instance. A mark-for-removal rename is accepted by the API but its task
+// then fails; stop and destroy tasks succeed, so the collector can run to the end.
 func newRemovalTestGroup(t *testing.T, opts removalTestServer) *InstanceGroup {
 	t.Helper()
 
@@ -170,6 +175,8 @@ func newRemovalTestGroup(t *testing.T, opts removalTestServer) *InstanceGroup {
 
 	renameUPID := testUPID("qmconfig")
 	renameTask := taskHandler(t, "qmconfig", taskStatusStopped, "VM is locked (clone)", "TASK ERROR: VM is locked (clone)")
+	stopTask := taskHandler(t, "qmstop", taskStatusStopped, taskExitStatusOK, "")
+	destroyTask := taskHandler(t, "qmdestroy", taskStatusStopped, taskExitStatusOK, "")
 
 	configResponse := opts.configResponse
 	if configResponse == "" {
@@ -218,11 +225,23 @@ func newRemovalTestGroup(t *testing.T, opts removalTestServer) *InstanceGroup {
 			fmt.Fprint(w, `{"data":{}}`)
 		case strings.Contains(r.URL.Path, "/tasks/") && strings.HasSuffix(r.URL.Path, "/status"):
 			counts.taskPolls.Add(1)
-			renameTask(w, r)
+
+			// Answer each task by the type in its UPID: Task.Ping replaces the whole task with
+			// the answer, so answering a stop with the rename's status would turn it into one.
+			switch {
+			case strings.Contains(r.URL.Path, ":qmstop:"):
+				stopTask(w, r)
+			case strings.Contains(r.URL.Path, ":qmdestroy:"):
+				destroyTask(w, r)
+			default:
+				renameTask(w, r)
+			}
 		case route == "GET status/current":
 			fmt.Fprintf(w, `{"data":{"vmid":%d,"name":%q,"status":"running"}}`, m.vmid, m.name)
 		case route == "GET config":
-			if m.fetchedName != "" {
+			if m.fetchedNameAfterStop != "" && counts.requested(m.vmid, http.MethodPost, "/status/stop") {
+				fmt.Fprintf(w, `{"data":{"name":%q}}`, m.fetchedNameAfterStop)
+			} else if m.fetchedName != "" {
 				fmt.Fprintf(w, `{"data":{"name":%q}}`, m.fetchedName)
 			} else {
 				fmt.Fprint(w, `{"data":{}}`)
@@ -230,6 +249,10 @@ func newRemovalTestGroup(t *testing.T, opts removalTestServer) *InstanceGroup {
 		case route == "POST config":
 			counts.configPOSTs.Add(1)
 			fmt.Fprint(w, configResponse)
+		case route == "POST status/stop":
+			fmt.Fprintf(w, `{"data":%q}`, testUPID("qmstop"))
+		case route == "DELETE ":
+			fmt.Fprintf(w, `{"data":%q}`, testUPID("qmdestroy"))
 		default:
 			renameTask(w, r)
 		}
