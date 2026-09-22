@@ -203,16 +203,8 @@ func (ig *InstanceGroup) Update(ctx context.Context, update func(instance string
 			continue
 		}
 
-		var state provider.State
-
-		switch member.Name {
-		case ig.InstanceNameCreating:
-			state = provider.StateCreating
-		case ig.InstanceNameRunning:
-			state = provider.StateRunning
-		case ig.InstanceNameRemoving:
-			state = provider.StateDeleting
-		default:
+		state, ok := ig.stateForName(member.Name)
+		if !ok {
 			continue // Unknown name, skipping...
 		}
 

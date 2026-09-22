@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -99,14 +101,36 @@ type removalTestServer struct {
 type removalTestMember struct {
 	vmid uint64
 	name string
+	// fetchedName, when set, is the name the VM's config carries (what a rename writes), so a
+	// test can simulate a VM renamed since the pool was listed. status/current keeps serving
+	// the listed name, which pins fetchedName's preference for the config.
+	fetchedName string
 }
 
 // removalRequestCounts records how often the fake was asked for each of the two things a
-// rename can do, so a test can assert on what was *not* requested. The counters are atomic
-// because markInstancesForRemoval drives the fake from one goroutine per instance.
+// rename can do, and every request it served, so a test can assert on what was *not*
+// requested. It is safe for concurrent use because markInstancesForRemoval drives the fake from
+// one goroutine per instance.
 type removalRequestCounts struct {
 	configPOSTs atomic.Int64
 	taskPolls   atomic.Int64
+	mu          sync.Mutex
+	paths       []string // method + " " + path for every request; guarded by mu
+}
+
+// requestsFor returns the recorded request entries that contain /qemu/<vmid>/ so a test can
+// assert on exactly which operations were performed for a specific VM.
+func (c *removalRequestCounts) requestsFor(vmid uint64) []string {
+	filter := fmt.Sprintf("/qemu/%d/", vmid)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []string
+	for _, p := range c.paths {
+		if strings.Contains(p, filter) {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // newLogBuffer returns a logger and the buffer it writes to, so a test can assert on what a
@@ -147,38 +171,55 @@ func newRemovalTestGroup(t *testing.T, opts removalTestServer) *InstanceGroup {
 		members = []removalTestMember{{vmid: 100, name: "fleeting-creating"}}
 	}
 
-	var (
-		poolMembers  = make([]string, 0, len(members))
-		memberStatus = make(map[string]string, len(members))
-		memberConfig = make(map[string]bool, len(members))
-	)
+	poolMembers := make([]string, 0, len(members))
+	memberByVMID := make(map[string]removalTestMember, len(members))
 
 	for _, member := range members {
 		poolMembers = append(poolMembers,
 			fmt.Sprintf(`{"vmid":%d,"type":"qemu","name":%q,"node":"pve-node"}`, member.vmid, member.name))
-		memberStatus[fmt.Sprintf("/nodes/pve-node/qemu/%d/status/current", member.vmid)] =
-			fmt.Sprintf(`{"data":{"vmid":%d,"name":%q,"status":"running"}}`, member.vmid, member.name)
-		memberConfig[fmt.Sprintf("/nodes/pve-node/qemu/%d/config", member.vmid)] = true
+		memberByVMID[strconv.FormatUint(member.vmid, 10)] = member
 	}
 
 	poolBody := fmt.Sprintf(`{"data":[{"poolid":"test-pool","members":[%s]}]}`, strings.Join(poolMembers, ","))
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		counts.mu.Lock()
+		counts.paths = append(counts.paths, r.Method+" "+r.URL.Path)
+		counts.mu.Unlock()
+
+		// Per-VM routes are "<method> <suffix>" of /nodes/pve-node/qemu/<vmid>[/<suffix>], set
+		// only for a listed vmid.
+		var (
+			m     removalTestMember
+			route string
+		)
+
+		if rest, isVM := strings.CutPrefix(r.URL.Path, "/nodes/pve-node/qemu/"); isVM {
+			vmid, suffix, _ := strings.Cut(rest, "/")
+			if member, ok := memberByVMID[vmid]; ok {
+				m, route = member, r.Method+" "+suffix
+			}
+		}
+
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/pools"):
 			fmt.Fprint(w, poolBody)
 		case r.URL.Path == "/nodes/pve-node/status":
 			fmt.Fprint(w, `{"data":{}}`)
-		case memberStatus[r.URL.Path] != "":
-			fmt.Fprint(w, memberStatus[r.URL.Path])
-		case memberConfig[r.URL.Path] && r.Method == http.MethodGet:
-			fmt.Fprint(w, `{"data":{}}`)
-		case memberConfig[r.URL.Path] && r.Method == http.MethodPost:
-			counts.configPOSTs.Add(1)
-			fmt.Fprint(w, configResponse)
 		case strings.Contains(r.URL.Path, "/tasks/") && strings.HasSuffix(r.URL.Path, "/status"):
 			counts.taskPolls.Add(1)
 			renameTask(w, r)
+		case route == "GET status/current":
+			fmt.Fprintf(w, `{"data":{"vmid":%d,"name":%q,"status":"running"}}`, m.vmid, m.name)
+		case route == "GET config":
+			if m.fetchedName != "" {
+				fmt.Fprintf(w, `{"data":{"name":%q}}`, m.fetchedName)
+			} else {
+				fmt.Fprint(w, `{"data":{}}`)
+			}
+		case route == "POST config":
+			counts.configPOSTs.Add(1)
+			fmt.Fprint(w, configResponse)
 		default:
 			renameTask(w, r)
 		}
@@ -191,6 +232,7 @@ func newRemovalTestGroup(t *testing.T, opts removalTestServer) *InstanceGroup {
 	ig.Pool = "test-pool"
 	ig.TemplateID = &templateID
 	ig.InstanceNameCreating = "fleeting-creating"
+	ig.InstanceNameRunning = "fleeting-running"
 	ig.InstanceNameRemoving = "fleeting-removing"
 	ig.InstanceTagsRemoving = "fleeting-removing"
 	ig.log = log

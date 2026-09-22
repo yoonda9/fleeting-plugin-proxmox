@@ -123,7 +123,6 @@ func TestDecreaseReportsOnlyAttemptedSuccesses(t *testing.T) {
 		{vmid: 100, name: "fleeting-running"},
 		{vmid: 101, name: "fleeting-removing"},
 	}})
-	ig.InstanceNameRunning = "fleeting-running"
 
 	// 100 is the only one attempted -- its rename is accepted and its task then fails -- while
 	// 101 is counted without a request being made for it.
