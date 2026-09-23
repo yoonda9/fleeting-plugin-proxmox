@@ -3,6 +3,7 @@ package plugin
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -121,7 +122,13 @@ type removalRequestCounts struct {
 	configPOSTs atomic.Int64
 	taskPolls   atomic.Int64
 	mu          sync.Mutex
-	paths       []string // method + " " + path for every request; guarded by mu
+	paths       []string         // method + " " + path for every request; guarded by mu
+	renames     []map[string]any // body of every config POST; guarded by mu
+}
+
+// removalTestDigest is the config digest the fake serves for vmid.
+func removalTestDigest(vmid uint64) string {
+	return fmt.Sprintf("digest-%d", vmid)
 }
 
 // requestsFor returns the recorded request entries for /qemu/<vmid> itself (the route a VM
@@ -240,15 +247,25 @@ func newRemovalTestGroup(t *testing.T, opts removalTestServer) *InstanceGroup {
 		case route == "GET status/current":
 			fmt.Fprintf(w, `{"data":{"vmid":%d,"name":%q,"status":"running"}}`, m.vmid, m.name)
 		case route == "GET config":
+			// An empty config name falls back to the status name, as an absent one would.
+			name := m.fetchedName
 			if m.fetchedNameAfterStop != "" && counts.requested(m.vmid, http.MethodPost, "/status/stop") {
-				fmt.Fprintf(w, `{"data":{"name":%q}}`, m.fetchedNameAfterStop)
-			} else if m.fetchedName != "" {
-				fmt.Fprintf(w, `{"data":{"name":%q}}`, m.fetchedName)
-			} else {
-				fmt.Fprint(w, `{"data":{}}`)
+				name = m.fetchedNameAfterStop
 			}
+
+			fmt.Fprintf(w, `{"data":{"digest":%q,"name":%q}}`, removalTestDigest(m.vmid), name)
 		case route == "POST config":
 			counts.configPOSTs.Add(1)
+
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("config POST body: %v", err)
+			}
+
+			counts.mu.Lock()
+			counts.renames = append(counts.renames, body)
+			counts.mu.Unlock()
+
 			fmt.Fprint(w, configResponse)
 		case route == "POST status/stop":
 			fmt.Fprintf(w, `{"data":%q}`, testUPID("qmstop"))
@@ -366,6 +383,24 @@ func TestMarkInstanceForRemovalRefusesRenamedVM(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The rename must carry the digest of the config whose name getListedVM checked, so Proxmox
+// refuses it if another manager changed the VM between the check and the rename.
+func TestMarkInstanceForRemovalSendsDigest(t *testing.T) {
+	counts := &removalRequestCounts{}
+	ig := newRemovalTestGroup(t, removalTestServer{requests: counts})
+
+	member := &proxmox.ClusterResource{VMID: 100, Type: vmTypeQEMU, Name: "fleeting-creating", Node: "pve-node"}
+
+	err := ig.markInstanceForRemoval(context.Background(), member)
+	require.ErrorIs(t, err, ErrTaskFailed)
+	require.Len(t, counts.renames, 1)
+	require.Equal(t, map[string]any{
+		vmOptName:   "fleeting-removing",
+		vmOptTags:   "fleeting-removing",
+		vmOptDigest: removalTestDigest(100),
+	}, counts.renames[0])
 }
 
 // The rename is the only evidence the collector will ever see that an instance is to be
